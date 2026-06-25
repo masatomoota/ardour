@@ -2,6 +2,8 @@
 
 > **ABSTRACT (English, for any LLM picking this up cold):** This document is a complete, self-contained handoff for continuing work on a **clean-room hardening of Ardour's experimental MCP-over-HTTP control surface** so an LLM can drive Ardour by natural language (audio-app analogue of Codex/Cursor). The branch `feature/mcp-fresh-macos` already builds end-to-end on macOS arm64 against Homebrew deps, the patched MCP surface dylib loads at runtime, and the MCP protocol has been live-verified with curl (initialize, tools/list, Host-header rejection, and a new `track/get_meter` tool). You do **not** need the originating chat. Prose is Japanese, but file paths, identifiers, commands, and code are English — every claim carries a `file:line` or commit citation you can verify. Start at §0, then §1, then §3 (verified run book) or §6 (roadmap for next waves).
 
+> **See also:** project-wide master handoff at https://github.com/masatomoota/llm-daw-handoff (chronological narrative, decision tree, prioritized roadmap to 100%, auto-start protocol).
+
 ---
 
 ## 0. このドキュメントの使い方・前提
