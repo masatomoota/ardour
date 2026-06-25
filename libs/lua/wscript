@@ -10,9 +10,18 @@ def configure(conf):
     pass
 
 def build(bld):
+    # Prepend vendored lua source dir to CXXFLAGS so it is searched before
+    # any global --also-include path (e.g. /opt/homebrew/include) that could
+    # shadow our lua 5.3.5 headers with a system-installed Lua.
+    # We clone the env for this target and prepend -I so it beats the global CXXFLAGS.
+    lua_src_dir = bld.path.abspath()
+    lua_env = bld.env.derive()
+    lua_env.prepend_value('CXXFLAGS', '-I' + lua_src_dir)
+    lua_env.prepend_value('CFLAGS',   '-I' + lua_src_dir)
     obj=bld.stlib (source   = ['lua.cc', 'luastate.cc'],
                    cflags   = [ bld.env['compiler_flags_dict']['pic'] ],
                    cxxflags = [ bld.env['compiler_flags_dict']['pic'] ],
+                   env      = lua_env,
                    includes = ['.'],
                    export_includes = ['.'],
                    target = 'liblua',

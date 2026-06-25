@@ -27,5 +27,5 @@ def build(bld):
     obj.name         = 'libardour_cp'
     obj.target       = 'ardourcp'
     obj.use          = 'libardour libpbd'
-    obj.uselib       = 'GLIBMM SIGCPP XML OSX'
+    obj.uselib       = 'GLIBMM SIGCPP XML OSX ARCHIVE'
     obj.install_path = bld.env['LIBDIR']

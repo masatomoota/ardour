@@ -184,6 +184,7 @@ def build(bld):
     if sys.platform == 'darwin':
         obj.source   = libydk_sources + libydk_quartz_sources
         obj.cflags   += ['-xobjective-c']
+        obj.defines  += ['DISABLE_VISIBILITY'] # clang/Mach-O does not support __attribute__((alias))
         obj.uselib   += ' OSX' # -framework Cocoa -framework CoreFoundation -framework ApplicationServices
         obj.includes += ['quartz', 'quartz/ydk', 'ydk/quartz']
         obj.export_includes += ['quartz']

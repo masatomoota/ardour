@@ -407,7 +407,8 @@ def build(bld):
     obj.uselib       = ['GLIBMM','GTHREAD','AUBIO','SIGCPP','XML','UUID', 'LO', 'USB',
                         'SNDFILE','SAMPLERATE','LRDF','AUDIOUNITS', 'GIOMM', 'FFTW3F',
                         'LILV','SERD','SORD',
-                        'OSX','BOOST','CURL','TAGLIB','VAMPSDK','VAMPHOSTSDK','RUBBERBAND']
+                        'OSX','BOOST','CURL','TAGLIB','VAMPSDK','VAMPHOSTSDK','RUBBERBAND',
+                        'ARCHIVE']
     obj.use          = ['libpbd','libmidipp','libevoral',
                         'libaudiographer',
                         'libtemporal',
