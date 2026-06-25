@@ -53,6 +53,7 @@
 #include "ardour/dB.h"
 #include "ardour/internal_send.h"
 #include "ardour/location.h"
+#include "ardour/meter.h"
 #include "ardour/midi_model.h"
 #include "ardour/midi_region.h"
 #include "ardour/midi_source.h"
@@ -3045,6 +3046,10 @@ MCPHttpServer::start ()
 #endif
 
 	_info.port      = _port;
+	/* Security: bind to loopback only. Without this libwebsockets binds all
+	 * interfaces (0.0.0.0), exposing the unauthenticated control API to the LAN
+	 * while endpoint_url() advertises 127.0.0.1. Keep listen scope == advertised. */
+	_info.iface     = "127.0.0.1";
 	_info.protocols = _protocols;
 	_info.gid       = -1;
 	_info.uid       = -1;
@@ -3136,6 +3141,32 @@ MCPHttpServer::erase_client (struct lws* wsi)
 	}
 }
 
+/* Defence-in-depth against DNS-rebinding: even with a loopback listen socket a
+ * malicious web page can POST to http://127.0.0.1:<port>/mcp via a hostname that
+ * resolves to 127.0.0.1. Such requests carry the attacker's domain in the Host
+ * header, so only accept Host values that are themselves loopback. A missing Host
+ * header is allowed so as not to break compliant local CLI clients. */
+static bool
+host_header_is_loopback (const char* host)
+{
+	if (!host || !*host) {
+		return true;
+	}
+
+	std::string h (host);
+	std::string hostname;
+
+	if (h[0] == '[') {
+		std::string::size_type rb = h.find (']');
+		hostname = (rb == std::string::npos) ? h : h.substr (1, rb - 1);
+	} else {
+		std::string::size_type colon = h.rfind (':');
+		hostname = (colon == std::string::npos) ? h : h.substr (0, colon);
+	}
+
+	return hostname == "127.0.0.1" || hostname == "localhost" || hostname == "::1" || h == "::1";
+}
+
 int
 MCPHttpServer::handle_http (struct lws* wsi, ClientContext& ctx)
 {
@@ -3162,6 +3193,11 @@ MCPHttpServer::handle_http (struct lws* wsi, ClientContext& ctx)
 		path = uri;
 
 		if (path == "/mcp") {
+			char host[256];
+			int  hlen = lws_hdr_copy (wsi, host, sizeof (host), WSI_TOKEN_HOST);
+			if (hlen > 0 && !host_header_is_loopback (host)) {
+				return send_http_status (wsi, 403);
+			}
 			ctx.mcp_post = true;
 			return 0;
 		}
@@ -5389,8 +5425,11 @@ handle_plugin_tool_call (ARDOUR::Session& session, PBD::EventLoop* event_loop, c
 #ifdef __APPLE__
 		/* Some macOS plugins (Qt/Cocoa) require construction on the main/UI event loop.
 		 * Keep behavior unchanged on other platforms for now.
-		 */
-		if (_event_loop) {
+		 * Guard against re-entrant marshaling: tools/call is now already marshaled
+		 * onto the event loop (dispatch_jsonrpc), so calling call_slot() again from
+		 * that same thread would deadlock waiting on a slot that can't run. Only
+		 * marshal when we are genuinely on a different thread. */
+		if (_event_loop && PBD::EventLoop::get_event_loop_for_thread () != _event_loop) {
 			std::mutex              add_mutex;
 			std::condition_variable add_cv;
 			bool                    add_done = false;
@@ -7986,6 +8025,51 @@ dispatch_midi_region_tool_call (ARDOUR::Session& session, const std::string& too
 	return false;
 }
 
+/* Execute a tools/call by trying each group dispatcher in turn. Extracted from
+ * dispatch_jsonrpc so the whole call can be marshaled onto the event loop thread
+ * (see the tools/call branch below). Runs on the GUI/event-loop thread. */
+static std::string
+run_tools_call (ARDOUR::Session& session, PBD::EventLoop* event_loop, const std::string& tool_name, pt::ptree& root, const std::string& id)
+{
+	if (tool_name == "hello_world") {
+		std::string caller = root.get<std::string> ("params.arguments.name", "");
+		std::string text   = "Hello from Ardour";
+		if (!caller.empty ()) {
+			text += ", " + caller;
+		}
+		text += " (session: " + session.name () + ")";
+
+		return jsonrpc_result (
+		    id,
+		    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"") + json_escape (text) + "\"}]}");
+	}
+
+	std::string response;
+	if (dispatch_track_tool_call (session, tool_name, root, id, response)) {
+		return response;
+	}
+	if (dispatch_session_tool_call (session, tool_name, root, id, response)) {
+		return response;
+	}
+	if (dispatch_transport_tool_call (session, tool_name, root, id, response)) {
+		return response;
+	}
+	if (dispatch_markers_tool_call (session, tool_name, root, id, response)) {
+		return response;
+	}
+	if (dispatch_tracks_tool_call (session, tool_name, root, id, response)) {
+		return response;
+	}
+	if (dispatch_plugin_tool_call (session, event_loop, tool_name, root, id, response)) {
+		return response;
+	}
+	if (dispatch_midi_region_tool_call (session, tool_name, root, id, response)) {
+		return response;
+	}
+
+	return jsonrpc_error (id, -32602, "Unknown tool name");
+}
+
 std::string
 MCPHttpServer::dispatch_jsonrpc (const std::string& payload) const
 {
@@ -8050,56 +8134,40 @@ MCPHttpServer::dispatch_jsonrpc (const std::string& payload) const
 	}
 
 	if (method == "tools/call") {
-		std::string tool_name = canonical_tool_name (root.get<std::string> ("params.name", ""));
-		if (tool_name == "hello_world") {
-			std::string caller = root.get<std::string> ("params.arguments.name", "");
-			std::string text   = "Hello from Ardour";
-			if (!caller.empty ()) {
-				text += ", " + caller;
+		const std::string tool_name = canonical_tool_name (root.get<std::string> ("params.name", ""));
+
+		/* Thread-safety: tool handlers mutate the ARDOUR::Session (undo history,
+		 * backend ports, PBD signals) which assume the GUI/event-loop thread. This
+		 * server runs on its own libwebsockets service thread, so calling them
+		 * directly races with the GUI and can corrupt the undo transaction
+		 * (HistoryOwner::_current_trans is unguarded) or assert in debug builds.
+		 * Marshal the whole call onto the event loop and block for the result.
+		 * This generalizes the per-plugin marshaling that was previously limited
+		 * to macOS plugin construction. If we are already on the event loop (or
+		 * have none / cannot queue), run inline. */
+		if (_event_loop && PBD::EventLoop::get_event_loop_for_thread () != _event_loop) {
+			std::string             out;
+			std::mutex              done_mutex;
+			std::condition_variable done_cv;
+			bool                    done = false;
+
+			const bool queued = _event_loop->call_slot (MISSING_INVALIDATOR, [&] () {
+				out = run_tools_call (_session, _event_loop, tool_name, root, id);
+				{
+					std::lock_guard<std::mutex> lk (done_mutex);
+					done = true;
+				}
+				done_cv.notify_one ();
+			});
+
+			if (queued) {
+				std::unique_lock<std::mutex> lk (done_mutex);
+				done_cv.wait (lk, [&] { return done; });
+				return out;
 			}
-			text += " (session: " + _session.name () + ")";
-
-			return jsonrpc_result (
-			    id,
-			    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"") + json_escape (text) + "\"}]}");
 		}
 
-		std::string track_tool_response;
-		if (dispatch_track_tool_call (_session, tool_name, root, id, track_tool_response)) {
-			return track_tool_response;
-		}
-
-		std::string session_tool_response;
-		if (dispatch_session_tool_call (_session, tool_name, root, id, session_tool_response)) {
-			return session_tool_response;
-		}
-
-		std::string transport_tool_response;
-		if (dispatch_transport_tool_call (_session, tool_name, root, id, transport_tool_response)) {
-			return transport_tool_response;
-		}
-
-		std::string markers_tool_response;
-		if (dispatch_markers_tool_call (_session, tool_name, root, id, markers_tool_response)) {
-			return markers_tool_response;
-		}
-
-		std::string tracks_tool_response;
-		if (dispatch_tracks_tool_call (_session, tool_name, root, id, tracks_tool_response)) {
-			return tracks_tool_response;
-		}
-
-		std::string plugin_tool_response;
-		if (dispatch_plugin_tool_call (_session, _event_loop, tool_name, root, id, plugin_tool_response)) {
-			return plugin_tool_response;
-		}
-
-		std::string midi_region_tool_response;
-		if (dispatch_midi_region_tool_call (_session, tool_name, root, id, midi_region_tool_response)) {
-			return midi_region_tool_response;
-		}
-
-		return jsonrpc_error (id, -32602, "Unknown tool name");
+		return run_tools_call (_session, _event_loop, tool_name, root, id);
 	}
 
 	return jsonrpc_error (id, -32601, "Method not found");
