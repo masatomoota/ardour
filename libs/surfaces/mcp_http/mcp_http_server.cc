@@ -3391,6 +3391,65 @@ handle_track_get_fader_tool (ARDOUR::Session& session, const pt::ptree& root, co
 }
 
 static std::string
+handle_track_get_meter_tool (ARDOUR::Session& session, const pt::ptree& root, const std::string& id)
+{
+	const std::string route_id = root.get<std::string> ("params.arguments.id", "");
+
+	if (route_id.empty ()) {
+		return jsonrpc_error (id, -32602, "Missing track id");
+	}
+
+	const std::shared_ptr<ARDOUR::Route> route = route_by_mcp_id (session, route_id);
+	if (!route) {
+		return jsonrpc_error (id, -32602, "Route not found");
+	}
+
+	std::shared_ptr<ARDOUR::PeakMeter> meter = route->peak_meter ();
+	if (!meter) {
+		return jsonrpc_error (id, -32000, "Route has no meter");
+	}
+
+	const uint32_t nchans = meter->input_streams ().n_audio ();
+
+	std::ostringstream ss;
+	ss << "{\"id\":\"" << route->id ().to_s () << "\""
+	   << ",\"name\":\"" << json_escape (route->name ())
+	   << "\",\"channels\":" << nchans
+	   << ",\"peakDb\":[";
+
+	bool   have_max = false;
+	double max_db   = 0.0;
+	for (uint32_t n = 0; n < nchans; ++n) {
+		const float db = meter->meter_level (n, ARDOUR::MeterPeak);
+		if (n) {
+			ss << ",";
+		}
+		if (std::isfinite (db)) {
+			ss << db;
+			if (!have_max || (double)db > max_db) {
+				max_db   = (double)db;
+				have_max = true;
+			}
+		} else {
+			ss << "null";
+		}
+	}
+	ss << "]";
+
+	if (have_max) {
+		ss << ",\"maxPeakDb\":" << max_db;
+	} else {
+		ss << ",\"maxPeakDb\":null";
+	}
+	ss << "}";
+
+	const std::string structured = ss.str ();
+	return jsonrpc_result (
+	    id,
+	    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"Route meter levels (dBFS)\"}],\"structuredContent\":") + structured + "}");
+}
+
+static std::string
 handle_track_select_tool (ARDOUR::Session& session, const pt::ptree& root, const std::string& id)
 {
 	const std::string route_id = root.get<std::string> ("params.arguments.id", "");
@@ -3980,6 +4039,10 @@ dispatch_track_tool_call (ARDOUR::Session& session, const std::string& tool_name
 	}
 	if (tool_name == "track/get_fader") {
 		response = handle_track_get_fader_tool (session, root, id);
+		return true;
+	}
+	if (tool_name == "track/get_meter") {
+		response = handle_track_get_meter_tool (session, root, id);
 		return true;
 	}
 	if (tool_name == "track/select") {

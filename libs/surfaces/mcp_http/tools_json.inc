@@ -2396,6 +2396,37 @@ R"mcp(
       }
     },
     {
+      "name": "track_get_meter",
+      "title": "Get Route Meter",
+      "description": "Read the route's current peak meter levels in dBFS (per audio channel plus the channel maximum). Use to observe mix balance and verify the audible effect of edits.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "channels": { "type": "integer" },
+          "peakDb": {
+            "type": "array",
+            "items": { "type": [ "number", "null" ] }
+          },
+          "maxPeakDb": { "type": [ "number", "null" ] }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "track_select",
       "title": "Select Track",
       "description": "Select a route in Ardour.",
