@@ -18,7 +18,7 @@
 ## 1. 中核背景（なぜこの設計か）
 
 ### 1.1 出発点
-当該フォークには既に実験的な MCP-over-HTTP コントロールサーフェスが存在する：`libs/surfaces/mcp_http/`（`mcp_http_server.cc` 約 8{,}460 行、`tools_json.inc` 97 ツール、libwebsockets ベース、ポート 4820、JSON-RPC 2.0 / `protocolVersion 2025-03-26`）。Codex CLI / Claude Desktop / Gemini / Ollama から接続できる。
+当該フォークには既に実験的な MCP-over-HTTP コントロールサーフェスが存在する：`libs/surfaces/mcp_http/`（`mcp_http_server.cc` 約 8{,}840 行（Wave T3 後）、`tools_json.inc` 97 ツール、libwebsockets ベース、ポート 4820、JSON-RPC 2.0 / `protocolVersion 2025-03-26`）。Wave T3 で SSE `GET /events` エンドポイントを追加済み。Codex CLI / Claude Desktop / Gemini / Ollama から接続できる。
 
 ### 1.2 出発点の3つの欠陥（先行レビューで確定）
 1. **スレッド / RT 安全性**：lws サービススレッドから直接 `ARDOUR::Session` を変更し、GUI スレッドと並行する `begin_reversible_command` が **`HistoryOwner::_current_trans`（無ガード）** を破壊する。debug ビルドで `assert(false)` クラッシュ。
@@ -43,21 +43,23 @@
 - ブランチ：`feature/mcp-fresh-macos`（`master` から分岐）
 - コミット（古い順 → 新しい順）：
   ```
-  b25a63c74a Refine f8f2572f use only with MINGW/Windows                   (HEAD~7, upstream)
-  356c5839cf Fix USB surface compile when libusb-dev is not installed       (HEAD~6, upstream)
-  0834ec2610 build: enable macOS (arm64) dev build against Homebrew deps    (HEAD~5, Wave 0)
-  36b0f04fb0 mcp_http: harden — thread marshaling, localhost bind, Host header check  (HEAD~4, Wave 1a)
-  5129c6d773 mcp_http: add track/get_meter — real-time peak readback (dBFS)            (HEAD~3, Wave 1b)
-  2ea50d0292 docs: add MCP_LLM_CONTROL_HANDOFF.md (Wave 3 handoff)                     (HEAD~2, Wave 3)
-  458f99a63b gitignore: add .env to prevent API key leakage                             (HEAD~1, Wave 3b)
-  19853971f0 mcp_http: add session/export_audio — open the delivery port (T1)           (HEAD,   Wave T1)
+  b25a63c74a Refine f8f2572f use only with MINGW/Windows                   (HEAD~8, upstream)
+  356c5839cf Fix USB surface compile when libusb-dev is not installed       (HEAD~7, upstream)
+  0834ec2610 build: enable macOS (arm64) dev build against Homebrew deps    (HEAD~6, Wave 0)
+  36b0f04fb0 mcp_http: harden — thread marshaling, localhost bind, Host header check  (HEAD~5, Wave 1a)
+  5129c6d773 mcp_http: add track/get_meter — real-time peak readback (dBFS)            (HEAD~4, Wave 1b)
+  2ea50d0292 docs: add MCP_LLM_CONTROL_HANDOFF.md (Wave 3 handoff)                     (HEAD~3, Wave 3)
+  458f99a63b gitignore: add .env to prevent API key leakage                             (HEAD~2, Wave 3b)
+  19853971f0 mcp_http: add session/export_audio — open the delivery port (T1)           (HEAD~1, Wave T1)
+  43f4848f09 mcp_http: add SSE GET /events + notifications/transport (T3 MVP)           (HEAD,   Wave T3)
   ```
 - `git status` クリーン（本 MD コミット前）。
 
 ### 2.2 ツール数サマリ
 - Wave 0 以前：95 ツール（`mcp_http_server.cc` 既存実装）
 - Wave 1b（`5129c6d773`）：`track/get_meter` 追加 → **96 ツール**
-- Wave T1（`19853971f0`）：`session/export_audio` 追加 → **97 ツール**（現在の正確な数）
+- Wave T1（`19853971f0`）：`session/export_audio` 追加 → **97 ツール**
+- Wave T3（`43f4848f0979bd83371aec31252cbd43011bba2b`）：SSE `GET /events` エンドポイント追加 → **97 ツール + 1 SSE エンドポイント**（現在の正確な数）
 
 ### 2.3 ワーキングツリーの汚れ
 - 追跡対象外の変更：なし（本ハンドオフ MD のみが untracked → 本ハンドオフのコミットで解消）。
@@ -165,6 +167,27 @@ curl -v -H 'Host: evil.example.com:4820' -X POST -H 'Content-Type: application/j
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"track_get_meter","arguments":{"id":"<route_id>"}}}' \
   http://127.0.0.1:4820/mcp
+```
+
+### 3.9b SSE エンドポイント確認（Wave T3 以降）
+```bash
+# GET /events — SSE ストリームに接続（Ardour 起動・MCP 有効化後）
+curl -N -H 'Accept: text/event-stream' http://127.0.0.1:4820/events
+# expect: 接続直後に transport スナップショットが届く（例）:
+#   data: {"jsonrpc":"2.0","method":"notifications/transport",
+#          "params":{"state":"stopped","position_samples":0,
+#                    "position_seconds":0.000000,"sample_rate":48000}}
+#
+# その後 Ardour で再生を開始すると:
+#   data: {"jsonrpc":"2.0","method":"notifications/transport",
+#          "params":{"state":"playing","position_samples":...,"position_seconds":...,"sample_rate":48000}}
+#
+# 15 秒ごとにハートビート:
+#   : heartbeat
+
+# Host header check applies here too (403 for non-loopback Host):
+curl -v -H 'Host: evil.example.com:4820' http://127.0.0.1:4820/events
+# expect: HTTP 403
 ```
 
 ### 3.10 LLM クライアント接続
@@ -279,7 +302,7 @@ Wave 2 で実呼び出し成功：master bus（id=22, 2ch, transport stopped）�
                                   HTTP response (structuredContent + text fallback)
 ```
 
-Wave 0 出発点との差分：(1) `tools/call` 全体が GUI スレッドへ整流、(2) listen `0.0.0.0` → `127.0.0.1`、(3) Host loopback 検証、(4) `track/get_meter` ツール追加、(5) `session/export_audio` ツール追加（Wave T1）。
+Wave 0 出発点との差分：(1) `tools/call` 全体が GUI スレッドへ整流、(2) listen `0.0.0.0` → `127.0.0.1`、(3) Host loopback 検証、(4) `track/get_meter` ツール追加、(5) `session/export_audio` ツール追加（Wave T1）、(6) SSE `GET /events` エンドポイント追加（Wave T3）。
 
 ---
 
@@ -369,11 +392,10 @@ GPLv3/v2 とも有料配布可（§4）。義務は「配布相手への完全�
 3. §3.7〜3.9 で MCP 疎通確認。
 4. ここまで通れば「環境再現済み」、Phase 1 タスクを 1 つ選んで着手。
 
-### 11.2 推奨：Phase 2 の SSE / notifications から着手
-Phase 1 の機能追加は工数が大きく、価値も漸進的。Phase 2 の**フィードバック / SSE** が最も差別化価値が高い：
-- 既存資産：`feedback.cc`（websockets サーフェス）と `osc_route_observer.cc` がテンプレート
-- 実装目標：peak meter / playhead position の non-polling push
-- 成果：エージェントが「観測 → 編集 → 観測」を低コストで回せる
+### 11.2 推奨：T2（オートメーション曲線）が次の最優先
+Wave T3（SSE `GET /events`、commit `43f4848f0979bd83371aec31252cbd43011bba2b`）で知覚ループ MVP は完成した。トランスポート状態変化が `notifications/transport` として push される。次の最優先は：
+- **T2（オートメーション曲線編集）**：`automation/get_lane`, `automation/set_curve`, `automation/set_mode`。`ControlList` 点列 API（`libs/evoral/ControlList.h:158-222`）が中核。
+- **SSE 拡張**（T3 follow-up）：`notifications/meter`（10Hz ポーリング）、`notifications/position`（再生中のヘッドアップデート）、`notifications/route_changed`、per-client フィルタ。既存 `connect_transport_signals()` パターンを踏襲するだけで追加可能。
 
 ### 11.3 落とし穴
 - **`echo $?` を信用しない**（§3.5）
@@ -389,7 +411,7 @@ Phase 1 の機能追加は工数が大きく、価値も漸進的。Phase 2 の*
 ## 12. 来歴・検証メタデータ
 
 - 解析・実装起点：`b25a63c74a` (`9.7-88-gb25a63c74a`)
-- ブランチ：`feature/mcp-fresh-macos`（`0834ec2610` → `36b0f04fb0` → `5129c6d773` → `2ea50d0292` → `458f99a63b` → `19853971f0`）
+- ブランチ：`feature/mcp-fresh-macos`（`0834ec2610` → `36b0f04fb0` → `5129c6d773` → `2ea50d0292` → `458f99a63b` → `19853971f0` → `43f4848f09`）
 - ビルド・検証マシン：Mac mini M4（arm64, 10 cores, macOS Apple clang 17, Homebrew 6.0.3）
 - 検証手法：static（dylib / nm / JSON 妥当性 / string table）＋ live（curl による MCP 疎通、Host header rejection、`track_get_meter` 実呼び出し）。Wave T1 はライブ Ardour なしのため static 確認のみ（`session/export_audio` 文字列・`session_export_audio` 文字列いずれも dylib string table に存在確認済み）。詳細は §6.1。
 - 補足設計レポート（リポ外、参考）：作業ホスト `/Volumes/work-ssd-4TB-USB4/_Git_Repository/llm-daw-report/` の PDF 4 部。**本ハンドオフはこれらに依存せず単体で完結**。
@@ -500,9 +522,142 @@ Phase 1 の機能追加は工数が大きく、価値も漸進的。Phase 2 の*
 ### 13.7 推奨次波
 
 - **T2（オートメーション曲線）**：ミックスの時間軸操作。依存なし。
-- **T3（SSE 通知）**：知覚ループ確立＋`session/export_audio` の非同期化に必要。
-- T3 → `session/export_audio` の非同期バージョン（`do_export` 後すぐ返却、完了時 SSE `notifications/export_complete` を送出）が理想形。
+- **T3（SSE 通知）**：✅ **Wave T3 で MVP 完了**（commit `43f4848f0979bd83371aec31252cbd43011bba2b`）。`GET /events` で `notifications/transport` をストリーミング配信中。拡張（meter / position / route_changed）は §14 の open items を参照。
+- T3 → `session/export_audio` の非同期バージョン（`do_export` 後すぐ返却、完了時 SSE `notifications/export_complete` を送出）が理想形（follow-up item）。
 
 ---
 
-*End of handoff. 次の LLM へ：§3 でビルド・起動・MCP 疎通を再現確認 → §8 から残作業を選ぶ。Phase 0（堅牢化）は完了し、Wave T1（`session/export_audio`）で納品口が開いた。次は T2（オートメーション）または T3（SSE）が最優先候補。*
+## 14. Wave T3：SSE / notifications/transport （知覚ループ MVP）
+
+**コミット `43f4848f0979bd83371aec31252cbd43011bba2b`** — 2026-06-26 — `mcp_http: add SSE GET /events + notifications/transport (T3 MVP)`
+
+### 14.1 エンドポイントと接続仕様
+
+| 項目 | 内容 |
+|---|---|
+| URL | `GET http://127.0.0.1:4820/events` |
+| レスポンスヘッダ | `Content-Type: text/event-stream`, `Cache-Control: no-cache` |
+| ボディ | Server-Sent Events ストリーム（無限持続接続）|
+| Host ヘッダ検証 | 同 `POST /mcp` と同一（loopback 以外で 403）|
+| ハートビート | `": heartbeat\n\n"` を 15 秒ごと（プロキシ / CDN タイムアウト対策）|
+| 初期フレーム | 接続直後にトランスポート状態スナップショットを 1 枚送信 |
+
+### 14.2 イベントペイロードスキーマ（verbatim）
+
+SSE の各フレームは `data: <JSON>\n\n` の形式で送出される。JSON 本体は JSON-RPC 2.0 Notification（`id` フィールドなし）：
+
+```
+data: {"jsonrpc":"2.0","method":"notifications/transport","params":{"state":"<STATE>","position_samples":<INT64>,"position_seconds":<FLOAT>,"sample_rate":<INT64>}}
+```
+
+`state` の値域：
+- `"stopped"` — トランスポート停止中
+- `"playing"` — 再生中（録音なし）
+- `"recording"` — 録音中（`actively_recording()` が true）
+- `"looping"` — ループ再生中（`get_play_loop()` が true かつ録音なし）
+
+優先順：`recording` > `looping` > `playing` > `stopped`（ソース：`build_transport_event()`, `mcp_http_server.cc:3436-3439`）。
+
+### 14.3 ハンドラ実装ウォークスルー
+
+**接続受け入れ（`handle_http`、`mcp_http_server.cc:3251-3280`）**
+
+`handle_http` 内の `path == "/events"` 分岐：
+1. Host ヘッダを loopback 検証（`host_header_is_loopback()`）→ 失敗で 403
+2. `send_sse_headers()` でレスポンスヘッダ送信（`mcp_http_server.cc:3385-3420`）
+3. `new SseSubscriber()` を作成し `_sse_subscribers` に push（mutex 保護）
+4. `ctx.sse_client = true` を設定して `handle_http_writeable` で SSE ドレインパスを使わせる
+5. 初期スナップショット（`build_transport_event()`）を `ctx.sse_queue` に積み、`lws_callback_on_writable()` を呼ぶ
+
+**ドレイン（`handle_http_writeable`、`mcp_http_server.cc:3380-3532`）**
+
+`ctx.sse_client` が true の場合：
+1. `ctx.sse_queue_mutex` を取りフレームをデキュー
+2. `lws_write(wsi, frame, LWS_WRITE_HTTP)` で送信
+3. キューが空でなければ自分で `lws_callback_on_writable()` を再スケジュール
+4. タイムスタンプが 15 秒を超えた場合はハートビート送信
+
+**切断（`LWS_CALLBACK_CLOSED_HTTP`、`mcp_http_server.cc:3182-3194`）**
+
+`_sse_subscribers` から該当 wsi を `std::remove_if` + `erase` で除去（mutex 保護）。
+
+**シグナル接続（`connect_transport_signals`、`mcp_http_server.cc:3506-3526`）**
+
+`start()` 内（`mcp_http_server.cc:3092`）で呼ばれ、`Session::TransportStateChange` と `Session::RecordStateChanged` を `_sse_signal_connections`（`ScopedConnectionList`）に登録：
+
+```cpp
+_session.TransportStateChange.connect (
+    _sse_signal_connections, MISSING_INVALIDATOR,
+    std::bind (&MCPHttpServer::on_transport_state_changed, this),
+    _event_loop);  // ← _event_loop 引数でクロススレッドマーシャル指定
+
+_session.RecordStateChanged.connect (
+    _sse_signal_connections, MISSING_INVALIDATOR,
+    std::bind (&MCPHttpServer::on_transport_state_changed, this),
+    _event_loop);
+```
+
+**イベント発火（`on_transport_state_changed`、`mcp_http_server.cc:3497-3501`）**
+
+```cpp
+void MCPHttpServer::on_transport_state_changed () {
+    const std::string frame = build_transport_event ();
+    broadcast_sse (frame);
+}
+```
+
+**ブロードキャスト（`broadcast_sse`、`mcp_http_server.cc:3456-3490`）**
+
+1. `_sse_subscribers_mutex` の下でターゲット wsi のリストを抽出
+2. 各 wsi の `ClientContext::sse_queue_mutex` の下でフレームを `sse_queue` に push
+3. `lws_callback_on_writable(wsi)` を呼ぶ（lws >= 3.x でスレッドセーフ）
+4. `lws_cancel_service(_context)` で lws ポールループを即時ウェイクアップ
+
+### 14.4 スレッドモデル
+
+| 場所 | スレッド | 操作 |
+|---|---|---|
+| `TransportStateChange` / `RecordStateChanged` シグナル発火 | RT オーディオスレッドまたは Butler スレッド | PBD signal 発行のみ |
+| `on_transport_state_changed()` 実行 | **GUI/event_loop スレッド** | `connect()` 時の `_event_loop` 引数によりマーシャル済み |
+| `broadcast_sse()` | GUI/event_loop スレッド | `sse_queue` への push と `lws_callback_on_writable()` 呼び出し |
+| `handle_http_writeable` でドレイン | lws サービススレッド | `sse_queue` からデキュー → `lws_write()` |
+| `lws_callback_on_writable()` | クロススレッド呼び出しを許容（lws 内部の atomic フラグ設定）| — |
+| `lws_cancel_service()` | 明示的にスレッドセーフ（lws-service.h:87-88 コメント）| — |
+
+**重要**：`_sse_subscribers` リスト自体の変更（push / erase）は lws サービススレッドのみが行う（`LWS_CALLBACK_HTTP` と `LWS_CALLBACK_CLOSED_HTTP` は同スレッド上）。`broadcast_sse()` は `_sse_subscribers_mutex` の下で**読み取り専用**コピーを取る。
+
+### 14.5 ファイル変更サマリ
+
+```
+commit 43f4848f0979bd83371aec31252cbd43011bba2b
+ libs/surfaces/mcp_http/mcp_http_server.cc | 284 +++++++++++++++++++++++++++-
+ libs/surfaces/mcp_http/mcp_http_server.h  |  33 ++++
+ 2 files changed, 313 insertions(+), 4 deletions(-)
+```
+
+ツール数の変化なし（SSE はツールではなくエンドポイント）：**97 ツール + 1 SSE エンドポイント**。
+
+### 14.6 スモーク検証結果
+
+- `errors=0`, `warnings=2`（macOS deployment target 不一致のみ）、`iterations=3`
+- dylib `libardour_mcp_http.dylib` の string table に `text/event-stream`（1件）、`notifications/transport`（1件）、`/events`（1件）が存在 → SSE コードがコンパイルに取り込まれていることを確認
+- シンボルプローブ：`broadcast_sse`（type T = global exported）、`on_transport_state_changed`（type T = global exported）確認済み
+- ライブ curl テスト：Ardour 未起動のため `Connection refused`（予期通り）。次回 Ardour 起動時に §3.9b のパターンで確認すること
+
+### 14.7 MVP の制限
+
+1. **トランスポート状態のみ**：`notifications/meter`（レベルメータ）、`notifications/position`（再生ヘッド 10Hz ポーリング）、`notifications/route_changed`（ルート追加/削除）は未実装
+2. **per-client フィルタなし**：接続した全クライアントが同一イベントを受信。特定トラックのみ購読する機能は未実装
+3. **ハートビートのみ 15 秒**：再接続後に状態スナップショットが 1 枚送られるが、その後は状態変化時のみ。ポーリング系通知（position）は今後追加
+4. **subscriber カウントによるシグナル切断最適化なし**：接続が 0 になってもシグナルはアクティブなまま（`ScopedConnectionList` のライフタイムはサーバ停止まで）
+
+### 14.8 推奨次波
+
+- **T2（オートメーション曲線編集）**：`automation/get_lane`, `automation/set_curve`, `automation/set_mode`。`ControlList`（`libs/evoral/ControlList.h:158-222`）が中核。今すぐ着手可能。
+- **SSE 拡張 — notifications/meter**：`on_meter_update()` を追加し、10Hz タイマーで全ルートのピーク値を `notifications/meter` として push。`Route::peak_meter()->meter_level()` を使用（Wave 1b の `track/get_meter` と同じ API）。
+- **SSE 拡張 — notifications/position**：再生中に 100ms ごと `notifications/position` を push。`_session.transport_sample()` をポーリング → フレームが変化した場合のみ送信。
+- **session/export_audio 非同期化**（T1 follow-up）：`do_export()` 後すぐ `"status":"started"` を返し、完了時 SSE `notifications/export_complete` を push する形に切り替え（T3 があるから実現可能）。
+
+---
+
+*End of handoff. 次の LLM へ：§3 でビルド・起動・MCP 疎通を再現確認 → §8 から残作業を選ぶ。Phase 0（堅牢化）は完了。Wave T1（`session/export_audio`、`19853971f0`）で納品口が開き、Wave T3（`GET /events` SSE、`43f4848f09`）で知覚ループ MVP が完成した。次は T2（オートメーション曲線編集）が最優先候補。SSE 拡張（meter / position 通知）は §14 の open items を参照。*
