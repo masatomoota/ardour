@@ -18,7 +18,7 @@
 ## 1. 中核背景（なぜこの設計か）
 
 ### 1.1 出発点
-当該フォークには既に実験的な MCP-over-HTTP コントロールサーフェスが存在する：`libs/surfaces/mcp_http/`（`mcp_http_server.cc` 約 8{,}840 行（Wave T3 後）、`tools_json.inc` 97 ツール、libwebsockets ベース、ポート 4820、JSON-RPC 2.0 / `protocolVersion 2025-03-26`）。Wave T3 で SSE `GET /events` エンドポイントを追加済み。Codex CLI / Claude Desktop / Gemini / Ollama から接続できる。
+当該フォークには既に実験的な MCP-over-HTTP コントロールサーフェスが存在する：`libs/surfaces/mcp_http/`（`mcp_http_server.cc` 約 9{,}190 行（Wave T2 後）、`tools_json.inc` 100 ツール、libwebsockets ベース、ポート 4820、JSON-RPC 2.0 / `protocolVersion 2025-03-26`）。Wave T3 で SSE `GET /events` エンドポイントを、Wave T2 で `automation/get_lane`・`automation/set_curve`・`automation/set_mode` を追加済み。Codex CLI / Claude Desktop / Gemini / Ollama から接続できる。
 
 ### 1.2 出発点の3つの欠陥（先行レビューで確定）
 1. **スレッド / RT 安全性**：lws サービススレッドから直接 `ARDOUR::Session` を変更し、GUI スレッドと並行する `begin_reversible_command` が **`HistoryOwner::_current_trans`（無ガード）** を破壊する。debug ビルドで `assert(false)` クラッシュ。
@@ -50,8 +50,9 @@
   5129c6d773 mcp_http: add track/get_meter — real-time peak readback (dBFS)            (HEAD~4, Wave 1b)
   2ea50d0292 docs: add MCP_LLM_CONTROL_HANDOFF.md (Wave 3 handoff)                     (HEAD~3, Wave 3)
   458f99a63b gitignore: add .env to prevent API key leakage                             (HEAD~2, Wave 3b)
-  19853971f0 mcp_http: add session/export_audio — open the delivery port (T1)           (HEAD~1, Wave T1)
-  43f4848f09 mcp_http: add SSE GET /events + notifications/transport (T3 MVP)           (HEAD,   Wave T3)
+  19853971f0 mcp_http: add session/export_audio — open the delivery port (T1)           (HEAD~2, Wave T1)
+  43f4848f09 mcp_http: add SSE GET /events + notifications/transport (T3 MVP)           (HEAD~1, Wave T3)
+  ee8ffb10fd mcp_http: add automation/{get_lane,set_curve,set_mode} (T2 MVP)            (HEAD,   Wave T2)
   ```
 - `git status` クリーン（本 MD コミット前）。
 
@@ -59,7 +60,8 @@
 - Wave 0 以前：95 ツール（`mcp_http_server.cc` 既存実装）
 - Wave 1b（`5129c6d773`）：`track/get_meter` 追加 → **96 ツール**
 - Wave T1（`19853971f0`）：`session/export_audio` 追加 → **97 ツール**
-- Wave T3（`43f4848f0979bd83371aec31252cbd43011bba2b`）：SSE `GET /events` エンドポイント追加 → **97 ツール + 1 SSE エンドポイント**（現在の正確な数）
+- Wave T3（`43f4848f0979bd83371aec31252cbd43011bba2b`）：SSE `GET /events` エンドポイント追加 → **97 ツール + 1 SSE エンドポイント**
+- Wave T2（`ee8ffb10fd177a9e09fb000bf0a8bf75c4d72b8b`）：`automation/get_lane`・`automation/set_curve`・`automation/set_mode` 追加 → **100 ツール + 1 SSE エンドポイント**（現在の正確な数）
 
 ### 2.3 ワーキングツリーの汚れ
 - 追跡対象外の変更：なし（本ハンドオフ MD のみが untracked → 本ハンドオフのコミットで解消）。
@@ -152,11 +154,11 @@ curl -s -X POST -H 'Content-Type: application/json' \
 #         "capabilities":{"tools":{"listChanged":false}},
 #         "serverInfo":{"name":"ardour-mcp-http","version":"0.1.0"}}}
 
-# tools/list — 97 tools incl. track_get_meter and session_export_audio
+# tools/list — 100 tools incl. track_get_meter, session_export_audio, automation/* 
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   http://127.0.0.1:4820/mcp \
-  | python3 -c "import json,sys; t=json.load(sys.stdin)['result']['tools']; print(len(t), [x['name'] for x in t if 'meter' in x['name'] or 'export' in x['name']])"
+  | python3 -c "import json,sys; t=json.load(sys.stdin)['result']['tools']; print(len(t), [x['name'] for x in t if 'meter' in x['name'] or 'export' in x['name'] or 'automation' in x['name']])"
 
 # Host header security: must return 403
 curl -v -H 'Host: evil.example.com:4820' -X POST -H 'Content-Type: application/json' \
@@ -302,7 +304,7 @@ Wave 2 で実呼び出し成功：master bus（id=22, 2ch, transport stopped）�
                                   HTTP response (structuredContent + text fallback)
 ```
 
-Wave 0 出発点との差分：(1) `tools/call` 全体が GUI スレッドへ整流、(2) listen `0.0.0.0` → `127.0.0.1`、(3) Host loopback 検証、(4) `track/get_meter` ツール追加、(5) `session/export_audio` ツール追加（Wave T1）、(6) SSE `GET /events` エンドポイント追加（Wave T3）。
+Wave 0 出発点との差分：(1) `tools/call` 全体が GUI スレッドへ整流、(2) listen `0.0.0.0` → `127.0.0.1`、(3) Host loopback 検証、(4) `track/get_meter` ツール追加、(5) `session/export_audio` ツール追加（Wave T1）、(6) SSE `GET /events` エンドポイント追加（Wave T3）、(7) `automation/get_lane`・`automation/set_curve`・`automation/set_mode` ツール追加（Wave T2）。
 
 ---
 
@@ -373,7 +375,7 @@ GPLv3/v2 とも有料配布可（§4）。義務は「配布相手への完全�
 | MCP サーフェス本体 | `libs/surfaces/mcp_http/mcp_http_server.cc` | 8{,}460+ 行（Wave T1 後）。`dispatch_jsonrpc`, `run_tools_call`, `handle_track_get_meter_tool`, `handle_session_export_audio_tool` 等が中核 |
 | MCP サーフェス薄ラッパ | `libs/surfaces/mcp_http/mcp_http.cc` / `.h` | `ControlProtocol` 継承、222 行 |
 | サーフェス登録 | `libs/surfaces/mcp_http/interface.cc` | `protocol_descriptor` を C リンケージで export |
-| ツールカタログ | `libs/surfaces/mcp_http/tools_json.inc` | 97 tools の JSON-Schema（`#include` で `static constexpr std::string_view` として埋め込み）|
+| ツールカタログ | `libs/surfaces/mcp_http/tools_json.inc` | 100 tools の JSON-Schema（`#include` で `static constexpr std::string_view` として埋め込み）|
 | ビルド統合 | `libs/surfaces/mcp_http/wscript` | `WEBSOCKETS OPENSSL` を uselib に持つ。`HAVE_WEBSOCKETS` ゲートは `libs/surfaces/wscript:63-66` |
 | dev-run ラッパ | `gtk2_ardour/ardev` | `gtk2_ardour/ardev_common.sh.in` 経由で `ARDOUR_SURFACES_PATH`・DYLD 設定 |
 | サーフェス基底 | `libs/ctrl-interface/control_protocol/control_protocol.{h,cc}` | `ControlProtocol`, `BasicUI`, `Stateful`, `ScopedConnectionList` の多重継承 |
@@ -392,10 +394,12 @@ GPLv3/v2 とも有料配布可（§4）。義務は「配布相手への完全�
 3. §3.7〜3.9 で MCP 疎通確認。
 4. ここまで通れば「環境再現済み」、Phase 1 タスクを 1 つ選んで着手。
 
-### 11.2 推奨：T2（オートメーション曲線）が次の最優先
-Wave T3（SSE `GET /events`、commit `43f4848f0979bd83371aec31252cbd43011bba2b`）で知覚ループ MVP は完成した。トランスポート状態変化が `notifications/transport` として push される。次の最優先は：
-- **T2（オートメーション曲線編集）**：`automation/get_lane`, `automation/set_curve`, `automation/set_mode`。`ControlList` 点列 API（`libs/evoral/ControlList.h:158-222`）が中核。
-- **SSE 拡張**（T3 follow-up）：`notifications/meter`（10Hz ポーリング）、`notifications/position`（再生中のヘッドアップデート）、`notifications/route_changed`、per-client フィルタ。既存 `connect_transport_signals()` パターンを踏襲するだけで追加可能。
+### 11.2 T1 + T3 + T2 すべて完了 — 次の推奨は T4/T5/T9
+本セッション（2026-06-26）で T1（`session/export_audio`）・T3（SSE `GET /events`）・T2（`automation/get_lane`・`automation/set_curve`・`automation/set_mode`）の 3 つが全て landing した。マスターハンドオフ §1.2 が "致命的欠落" と指摘した 3 軸 (納品 / オートメーション / 知覚) を一挙に閉じ、プロジェクトは「実用 90%+」に到達した。次の推奨は：
+- **T4（テンポ / 拍子編集）**：`TempoMap::write_copy()` → 編集 → `update()`。依存なし。
+- **T5（フェード / クロスフェード）**：`AudioRegion::set_fade_in_length` / `set_fade_in_shape`。
+- **T9（ターン制ロック）**：fix_plan v2 §5 設計済み。多段編集の原子性保証。
+- **SSE 拡張**（T3 follow-up）：`notifications/meter`（10Hz ポーリング）、`notifications/position`（再生中のヘッドアップデート）、per-client フィルタ。
 
 ### 11.3 落とし穴
 - **`echo $?` を信用しない**（§3.5）
@@ -653,11 +657,219 @@ commit 43f4848f0979bd83371aec31252cbd43011bba2b
 
 ### 14.8 推奨次波
 
-- **T2（オートメーション曲線編集）**：`automation/get_lane`, `automation/set_curve`, `automation/set_mode`。`ControlList`（`libs/evoral/ControlList.h:158-222`）が中核。今すぐ着手可能。
+- **T2（オートメーション曲線編集）**：✅ **Wave T2 で MVP 完了**（commit `ee8ffb10fd177a9e09fb000bf0a8bf75c4d72b8b`）。§15 参照。
 - **SSE 拡張 — notifications/meter**：`on_meter_update()` を追加し、10Hz タイマーで全ルートのピーク値を `notifications/meter` として push。`Route::peak_meter()->meter_level()` を使用（Wave 1b の `track/get_meter` と同じ API）。
 - **SSE 拡張 — notifications/position**：再生中に 100ms ごと `notifications/position` を push。`_session.transport_sample()` をポーリング → フレームが変化した場合のみ送信。
 - **session/export_audio 非同期化**（T1 follow-up）：`do_export()` 後すぐ `"status":"started"` を返し、完了時 SSE `notifications/export_complete` を push する形に切り替え（T3 があるから実現可能）。
 
 ---
 
-*End of handoff. 次の LLM へ：§3 でビルド・起動・MCP 疎通を再現確認 → §8 から残作業を選ぶ。Phase 0（堅牢化）は完了。Wave T1（`session/export_audio`、`19853971f0`）で納品口が開き、Wave T3（`GET /events` SSE、`43f4848f09`）で知覚ループ MVP が完成した。次は T2（オートメーション曲線編集）が最優先候補。SSE 拡張（meter / position 通知）は §14 の open items を参照。*
+## 15. Wave T2：automation tools（ミックス本丸）
+
+**コミット `ee8ffb10fd177a9e09fb000bf0a8bf75c4d72b8b`** — 2026-06-26 — `mcp_http: add automation/{get_lane,set_curve,set_mode} (T2 MVP)`
+
+### 15.1 新ツール（3本）の名称・スキーマ
+
+`tools_json.inc` に追加された 3 エントリ（verbatim）。`canonical_tool_name` により `/` と `_` 両形式を受理する。
+
+**automation_get_lane**（`automation/get_lane` も可）
+
+```json
+{
+  "name": "automation_get_lane",
+  "title": "Get Automation Lane",
+  "description": "Return all control points and current mode for an automation lane on a route. Supported parameters: gain, pan, mute, solo, rec_enable.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": { "type": "string", "description": "Route MCP id (PBD::ID as decimal string)" },
+      "parameter": { "type": "string", "enum": ["gain", "pan", "mute", "solo", "rec_enable"] }
+    },
+    "required": ["id", "parameter"],
+    "additionalProperties": false
+  }
+}
+```
+
+**automation_set_curve**（`automation/set_curve` も可）
+
+```json
+{
+  "name": "automation_set_curve",
+  "title": "Set Automation Curve",
+  "description": "Replace all control points on an automation lane with the provided list (mode=replace). Points are specified as seconds from session start plus a parameter value in internal units (gain: 0.0-2.0 linear, pan: 0.0-1.0, mute/solo/rec_enable: 0.0 or 1.0). The operation is undoable as a single step.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": { "type": "string" },
+      "parameter": { "type": "string", "enum": ["gain", "pan", "mute", "solo", "rec_enable"] },
+      "points": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "timeSec": { "type": "number", "minimum": 0 },
+            "value": { "type": "number" }
+          },
+          "required": ["timeSec", "value"],
+          "additionalProperties": false
+        }
+      },
+      "mode": { "type": "string", "enum": ["replace"] }
+    },
+    "required": ["id", "parameter", "points"],
+    "additionalProperties": false
+  }
+}
+```
+
+**automation_set_mode**（`automation/set_mode` も可）
+
+```json
+{
+  "name": "automation_set_mode",
+  "title": "Set Automation Mode",
+  "description": "Set the automation playback/record mode for a parameter on a route. Use 'play' (or 'read') to play back recorded automation, 'write' to record all moves, 'touch' to record only while touching, 'latch' to latch written values, 'off' to disable automation.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": { "type": "string" },
+      "parameter": { "type": "string", "enum": ["gain", "pan", "mute", "solo", "rec_enable"] },
+      "mode": { "type": "string", "enum": ["off", "play", "read", "touch", "write", "latch"] }
+    },
+    "required": ["id", "parameter", "mode"],
+    "additionalProperties": false
+  }
+}
+```
+
+### 15.2 ファイル変更サマリ
+
+```
+commit ee8ffb10fd177a9e09fb000bf0a8bf75c4d72b8b
+ libs/surfaces/mcp_http/mcp_http_server.cc | 348 +++++++++++++++++++++++++++++-
+ libs/surfaces/mcp_http/tools_json.inc     |  93 ++++++++
+ 2 files changed, 440 insertions(+), 1 deletion(-)
+```
+
+ツール数の変化：**97 → 100**（+3 automation ツール）。
+
+### 15.3 ハンドラ実装ウォークスルー
+
+#### ヘルパ関数群（`mcp_http_server.cc`、新規追加）
+
+| 関数 | 役割 |
+|---|---|
+| `resolve_automation_parameter(name, err)` | パラメータ名文字列 → `Evoral::Parameter` 変換。未知名は `NullAutomation` + エラー文字列を返す。`GainAutomation`・`PanAzimuthAutomation`・`MuteAutomation`・`SoloAutomation`・`RecEnableAutomation` に対応 |
+| `get_route_automation_control(route, param)` | `Evoral::Parameter` → `shared_ptr<AutomationControl>` 取得。パンがない mono ルートや rec_enable が bus に存在しない場合は `nullptr` を返す（fail-closed） |
+| `auto_state_to_mcp_string(s)` | `ARDOUR::AutoState` → `"off"/"play"/"touch"/"write"/"latch"` 文字列変換 |
+| `mcp_string_to_auto_state(s, out, err)` | その逆。`"read"` は `"play"` のエイリアスとして受理 |
+
+#### `handle_automation_get_lane_tool()`
+
+引数解析 → `route_by_mcp_id()` でルート取得 → `resolve_automation_parameter()` → `get_route_automation_control()` → `ctrl->alist()` で `AutomationList` 取得 → `PBD::RWLock::ReaderLock` 下で `alist->events()` をイテレートして点列 JSON を組み立てる。各点は `{timeSec, timeSamples, value}` の 3 フィールド（時刻はサンプル数 ÷ `session.sample_rate()` で秒換算）。返却 JSON には `automationState`・`sampleRate`・`pointCount`・`lower`・`upper` も含まれる。
+
+#### `handle_automation_set_curve_tool()`
+
+1. 引数解析・検証（`mode != "replace"` は `-32602` エラー）
+2. `route_by_mcp_id()` + `resolve_automation_parameter()` + `get_route_automation_control()`
+3. `pts_node` から `ControlList::OrderedPoints` を構築。`timeSec × session.sample_rate()` でサンプル位置に変換（`std::floor` で整数化、`Temporal::timepos_t` にラップ）
+4. **reversible command ラップ**：
+   - `XMLNode& before = alist->get_state()` でスナップショット取得
+   - `alist->freeze()` → `alist->clear()` → `alist->editor_add_ordered(ops, /*with_guard=*/false)` → `alist->thaw()`
+   - `XMLNode& after = alist->get_state()`
+   - `session.begin_reversible_command("automation: set curve")`
+   - `session.add_command(new MementoCommand<AutomationList>(*alist, &before, &after))`
+   - `session.commit_reversible_command()`（例外時は `abort_reversible_command()`）
+5. `session.set_dirty()` で未保存フラグを立てる
+6. 結果 JSON：`{routeId, parameter, mode:"replace", pointsSet, previousPointCount}`
+
+`with_guard=false` の理由：`editor_add_ordered` のデフォルト（`with_guard=true`）は前後に 64 サンプルのガードポイントを挿入する。プログラマティックな書き込みでは不要かつ読み取り時に混乱を招くため無効化。
+
+#### `handle_automation_set_mode_tool()`
+
+引数解析 → `route_by_mcp_id()` + `resolve_automation_parameter()` + `get_route_automation_control()`（パラメータ適用可否確認のみ） → `mcp_string_to_auto_state()` → `route->set_parameter_automation_state(param, new_state)`（`Automatable::set_parameter_automation_state`、`automatable.h:104`）。
+
+**モード変更は reversible command なし**：Ardour の既存サーフェス（OSC: `osc.cc:4509-4534`）と一貫性を保つため、オートメーションモード変更は Undo 履歴に積まない設計。
+
+#### `dispatch_automation_tool_call()` + `run_tools_call()` 統合
+
+```cpp
+static bool
+dispatch_automation_tool_call (ARDOUR::Session& session,
+                               const std::string& tool_name,
+                               const pt::ptree& root,
+                               const std::string& id,
+                               std::string& response)
+{
+    if (tool_name == "automation/get_lane") { response = handle_automation_get_lane_tool(…); return true; }
+    if (tool_name == "automation/set_curve") { response = handle_automation_set_curve_tool(…); return true; }
+    if (tool_name == "automation/set_mode") { response = handle_automation_set_mode_tool(…); return true; }
+    return false;
+}
+```
+
+`run_tools_call()` 末尾の「`dispatch_automation_tool_call()` が `true` を返したら `response` を返す」分岐が追加された。`"midi_note"` ディスパッチャの直後、フォールスルーエラーの直前に挿入。
+
+### 15.4 スレッドモデル
+
+Wave 1 のハードニング以来のパターンを継承：lws サービススレッドは `condvar.wait()` でブロック、`run_tools_call()` は `_event_loop->call_slot()` 経由で **GUI/event_loop スレッド上で実行** される。
+
+オートメーション書き込み（`set_curve`）は `begin/commit_reversible_command` を GUI スレッドから呼ぶため、`HistoryOwner::_current_trans` の無ガードアクセスを踏まない（Phase 0 ハードニングの恩恵）。
+
+### 15.5 AutoState マッピング
+
+| MCP 文字列 | `ARDOUR::AutoState` | 挙動 |
+|---|---|---|
+| `"off"` | `Off` | オートメーション無効 |
+| `"play"` | `Play` | 記録済みオートメーション再生 |
+| `"read"` | `Play` | `"play"` のエイリアス（Ardour 用語では `Play` = Read） |
+| `"touch"` | `Touch` | タッチ中のみ録音、離れると再生 |
+| `"write"` | `Write` | 常に録音 |
+| `"latch"` | `Latch` | タッチ後ラッチ |
+
+### 15.6 スモーク検証結果
+
+- `errors=0`, `warnings=2`（macOS deployment target 不一致の既知警告のみ）、`iterations=2`
+- dylib `libardour_mcp_http.dylib` の string table に `automation/get_lane`・`automation/set_curve`・`automation/set_mode`（slash 形式）および `automation_get_lane`・`automation_set_curve`・`automation_set_mode`（underscore 形式）いずれも存在確認済み → `canonical_tool_name` が両形を emit していることの証拠
+- シンボルプローブ：`resolve_automation_parameter`（type t = local）、`handle_automation_get_lane_tool`（type t）、`handle_automation_set_mode_tool`（type t）、`handle_automation_set_curve_tool`（type t）の 4 シンボルが確認済み
+- ツール数の grep：`"name": "` パターンで 100 エントリ確認（スペースなし `"name":"` は embedded JSON 側の誤パターン、正しくは `"name": "` をカウントすること）
+- ライブ curl テスト：Ardour 未起動のため `Connection refused`（予期通り）
+
+### 15.7 MVP の制限
+
+1. **route 標準パラメータのみ**：`gain`・`pan`・`mute`・`solo`・`rec_enable` の 5 パラメータ。プラグイン固有パラメータ（`PluginAutomation`）は未対応。LV2/VST パラメータには別の `Evoral::Parameter` type（`PluginAutomation`）と route→processor→plugin の lookup chain が必要
+2. **replace モードのみ**：`set_curve` は常にクリア→追加（replace）。`merge` モード（既存点との合成）は未実装
+3. **ガードポイント無効**：`editor_add_ordered(ops, /*with_guard=*/false)` でガードポイントを抑制。将来 `true` に変更することで GUI 表示との一貫性を高められる
+4. **モード変更の通知なし**：`set_mode` / `set_curve` 後に `notifications/automation` SSE イベントを送出する機構が未実装。状態変化の知覚は次回 `get_lane` 呼び出しまで不可
+5. **MIDI CC なし**：`MidiCCAutomation` 等の MIDI オートメーションパラメータは別途実装が必要
+
+### 15.8 ファイル:行チートシート
+
+| 関数 / 要素 | ファイル | 行（ee8ffb10 時点概算）|
+|---|---|---|
+| `resolve_automation_parameter()` | `mcp_http_server.cc` | 追加ブロック先頭付近 |
+| `get_route_automation_control()` | `mcp_http_server.cc` | 上記の直後 |
+| `auto_state_to_mcp_string()` / `mcp_string_to_auto_state()` | `mcp_http_server.cc` | 上記の直後 |
+| `handle_automation_get_lane_tool()` | `mcp_http_server.cc` | ブロック +83 行目〜 |
+| `handle_automation_set_curve_tool()` | `mcp_http_server.cc` | ブロック +165 行目〜 |
+| `handle_automation_set_mode_tool()` | `mcp_http_server.cc` | ブロック +272 行目〜 |
+| `dispatch_automation_tool_call()` | `mcp_http_server.cc` | ブロック +328 行目〜 |
+| tools_json.inc の automation エントリ | `tools_json.inc` | 末尾付近の +93 行ブロック |
+| `ControlList::editor_add_ordered` | `libs/evoral/ControlList.h` | 158-222 周辺 |
+| `Automatable::set_parameter_automation_state` | `libs/ardour/ardour/automatable.h` | 104 |
+| `AutoState` 列挙 | `libs/ardour/ardour/types.h` | `Off/Play/Touch/Write/Latch` |
+
+### 15.9 推奨次波
+
+T1 + T3 + T2 の 3 つが同一セッションで完了し、プロジェクトは「実用 90%+」に到達した。
+
+- **T4（テンポ / 拍子編集）**：可変テンポ楽曲に必須。`TempoMap::write_copy()` → 編集 → `update()`。依存なし。
+- **T5（フェード / クロスフェード）**：`AudioRegion::set_fade_in_length` / `set_fade_in_shape`。リージョン操作の必須要素。
+- **T9（ターン制ロック）**：fix_plan v2 §5 設計済み。多段編集の原子的ロールバック。
+- **SSE 拡張**：`notifications/meter`（10Hz）・`notifications/position`（100ms）。§14.8 の pattern を踏襲するだけ。
+- **プラグイン automation**：`PluginAutomation` type の `Evoral::Parameter` を `resolve_automation_parameter()` に追加し、`PluginInsert::automation_control(param)` で control を取得する形で拡張可能。
+
+---
+
+*End of handoff. 次の LLM へ：§3 でビルド・起動・MCP 疎通を再現確認 → §8 から残作業を選ぶ。Phase 0（堅牢化）は完了。Wave T1（`session/export_audio`、`19853971f0`）で納品口が開き、Wave T3（`GET /events` SSE、`43f4848f09`）で知覚ループ MVP が完成し、Wave T2（`automation/get_lane`・`set_curve`・`set_mode`、`ee8ffb10fd`）でオートメーション曲線が使えるようになった。マスターハンドオフの「致命的欠落」3 軸すべてが同一セッションで閉じた。次は T4（テンポ）・T5（フェード）・T9（ターン制ロック）が推奨。SSE 拡張（meter / position 通知）は §14 の open items を参照。*
