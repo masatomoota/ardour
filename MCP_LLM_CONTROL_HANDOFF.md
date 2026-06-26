@@ -18,7 +18,7 @@
 ## 1. 中核背景（なぜこの設計か）
 
 ### 1.1 出発点
-当該フォークには既に実験的な MCP-over-HTTP コントロールサーフェスが存在する：`libs/surfaces/mcp_http/`（`mcp_http_server.cc` 約 8{,}160 行、`tools_json.inc` 約 96 ツール、libwebsockets ベース、ポート 4820、JSON-RPC 2.0 / `protocolVersion 2025-03-26`）。Codex CLI / Claude Desktop / Gemini / Ollama から接続できる。
+当該フォークには既に実験的な MCP-over-HTTP コントロールサーフェスが存在する：`libs/surfaces/mcp_http/`（`mcp_http_server.cc` 約 8{,}460 行、`tools_json.inc` 97 ツール、libwebsockets ベース、ポート 4820、JSON-RPC 2.0 / `protocolVersion 2025-03-26`）。Codex CLI / Claude Desktop / Gemini / Ollama から接続できる。
 
 ### 1.2 出発点の3つの欠陥（先行レビューで確定）
 1. **スレッド / RT 安全性**：lws サービススレッドから直接 `ARDOUR::Session` を変更し、GUI スレッドと並行する `begin_reversible_command` が **`HistoryOwner::_current_trans`（無ガード）** を破壊する。debug ビルドで `assert(false)` クラッシュ。
@@ -43,19 +43,27 @@
 - ブランチ：`feature/mcp-fresh-macos`（`master` から分岐）
 - コミット（古い順 → 新しい順）：
   ```
-  b25a63c74a Refine f8f2572f use only with MINGW/Windows                   (HEAD~5, upstream)
-  356c5839cf Fix USB surface compile when libusb-dev is not installed       (HEAD~4, upstream)
-  0834ec2610 build: enable macOS (arm64) dev build against Homebrew deps    (HEAD~3, Wave 0)
-  36b0f04fb0 mcp_http: harden — thread marshaling, localhost bind, Host header check  (HEAD~2, Wave 1a)
-  5129c6d773 mcp_http: add track/get_meter — real-time peak readback (dBFS)            (HEAD~1, Wave 1b)
+  b25a63c74a Refine f8f2572f use only with MINGW/Windows                   (HEAD~7, upstream)
+  356c5839cf Fix USB surface compile when libusb-dev is not installed       (HEAD~6, upstream)
+  0834ec2610 build: enable macOS (arm64) dev build against Homebrew deps    (HEAD~5, Wave 0)
+  36b0f04fb0 mcp_http: harden — thread marshaling, localhost bind, Host header check  (HEAD~4, Wave 1a)
+  5129c6d773 mcp_http: add track/get_meter — real-time peak readback (dBFS)            (HEAD~3, Wave 1b)
+  2ea50d0292 docs: add MCP_LLM_CONTROL_HANDOFF.md (Wave 3 handoff)                     (HEAD~2, Wave 3)
+  458f99a63b gitignore: add .env to prevent API key leakage                             (HEAD~1, Wave 3b)
+  19853971f0 mcp_http: add session/export_audio — open the delivery port (T1)           (HEAD,   Wave T1)
   ```
 - `git status` クリーン（本 MD コミット前）。
 
-### 2.2 ワーキングツリーの汚れ
+### 2.2 ツール数サマリ
+- Wave 0 以前：95 ツール（`mcp_http_server.cc` 既存実装）
+- Wave 1b（`5129c6d773`）：`track/get_meter` 追加 → **96 ツール**
+- Wave T1（`19853971f0`）：`session/export_audio` 追加 → **97 ツール**（現在の正確な数）
+
+### 2.3 ワーキングツリーの汚れ
 - 追跡対象外の変更：なし（本ハンドオフ MD のみが untracked → 本ハンドオフのコミットで解消）。
 - `build/` は `.gitignore` 対象（追跡なし）。
 
-### 2.3 GitHub 同期先
+### 2.4 GitHub 同期先
 - `origin` = `https://github.com/Ardour/ardour.git`（push 権なし）
 - `fork` = `https://github.com/masatomoota/ardour.git`（本作業者のフォーク、本ハンドオフコミット時に push）
 
@@ -142,11 +150,11 @@ curl -s -X POST -H 'Content-Type: application/json' \
 #         "capabilities":{"tools":{"listChanged":false}},
 #         "serverInfo":{"name":"ardour-mcp-http","version":"0.1.0"}}}
 
-# tools/list — 96 tools incl. track_get_meter
+# tools/list — 97 tools incl. track_get_meter and session_export_audio
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   http://127.0.0.1:4820/mcp \
-  | python3 -c "import json,sys; t=json.load(sys.stdin)['result']['tools']; print(len(t), [x['name'] for x in t if 'meter' in x['name']])"
+  | python3 -c "import json,sys; t=json.load(sys.stdin)['result']['tools']; print(len(t), [x['name'] for x in t if 'meter' in x['name'] or 'export' in x['name']])"
 
 # Host header security: must return 403
 curl -v -H 'Host: evil.example.com:4820' -X POST -H 'Content-Type: application/json' \
@@ -216,10 +224,10 @@ Wave 2 で実呼び出し成功：master bus（id=22, 2ch, transport stopped）�
 |---|---|---|
 | dylib (arm64 Mach-O) + `protocol_descriptor` export | ✅ | |
 | libwebsockets リンク | ✅ | `/opt/homebrew/opt/libwebsockets/lib/libwebsockets.21.dylib` |
-| `tools_json.inc` 妥当 JSON / 96 tools | ✅ | `track_get_meter` 含む |
+| `tools_json.inc` 妥当 JSON / 97 tools | ✅ | `track_get_meter`, `session_export_audio` 含む |
 | 起動 → 4820 LISTEN | ✅ | |
 | `initialize` protocolVersion 2025-03-26 | ✅ | |
-| `tools/list` 96 tools | ✅ | |
+| `tools/list` 97 tools | ✅ | |
 | `hello_world`, `session_get_info` 疎通 | ✅ | |
 | `track_get_meter` 実呼び出し | ✅ | |
 | Host header rejection (HTTP 403) | ✅ | |
@@ -271,7 +279,7 @@ Wave 2 で実呼び出し成功：master bus（id=22, 2ch, transport stopped）�
                                   HTTP response (structuredContent + text fallback)
 ```
 
-Wave 0 出発点との差分：(1) `tools/call` 全体が GUI スレッドへ整流、(2) listen `0.0.0.0` → `127.0.0.1`、(3) Host loopback 検証、(4) `track/get_meter` ツール追加。
+Wave 0 出発点との差分：(1) `tools/call` 全体が GUI スレッドへ整流、(2) listen `0.0.0.0` → `127.0.0.1`、(3) Host loopback 検証、(4) `track/get_meter` ツール追加、(5) `session/export_audio` ツール追加（Wave T1）。
 
 ---
 
@@ -339,10 +347,10 @@ GPLv3/v2 とも有料配布可（§4）。義務は「配布相手への完全�
 
 | 役割 | パス | コメント |
 |---|---|---|
-| MCP サーフェス本体 | `libs/surfaces/mcp_http/mcp_http_server.cc` | 8{,}160+ 行（hardening 後）。`dispatch_jsonrpc`, `run_tools_call`, `handle_track_get_meter_tool` 等が中核 |
+| MCP サーフェス本体 | `libs/surfaces/mcp_http/mcp_http_server.cc` | 8{,}460+ 行（Wave T1 後）。`dispatch_jsonrpc`, `run_tools_call`, `handle_track_get_meter_tool`, `handle_session_export_audio_tool` 等が中核 |
 | MCP サーフェス薄ラッパ | `libs/surfaces/mcp_http/mcp_http.cc` / `.h` | `ControlProtocol` 継承、222 行 |
 | サーフェス登録 | `libs/surfaces/mcp_http/interface.cc` | `protocol_descriptor` を C リンケージで export |
-| ツールカタログ | `libs/surfaces/mcp_http/tools_json.inc` | 96 tools の JSON-Schema（`#include` で `static constexpr std::string_view` として埋め込み）|
+| ツールカタログ | `libs/surfaces/mcp_http/tools_json.inc` | 97 tools の JSON-Schema（`#include` で `static constexpr std::string_view` として埋め込み）|
 | ビルド統合 | `libs/surfaces/mcp_http/wscript` | `WEBSOCKETS OPENSSL` を uselib に持つ。`HAVE_WEBSOCKETS` ゲートは `libs/surfaces/wscript:63-66` |
 | dev-run ラッパ | `gtk2_ardour/ardev` | `gtk2_ardour/ardev_common.sh.in` 経由で `ARDOUR_SURFACES_PATH`・DYLD 設定 |
 | サーフェス基底 | `libs/ctrl-interface/control_protocol/control_protocol.{h,cc}` | `ControlProtocol`, `BasicUI`, `Stateful`, `ScopedConnectionList` の多重継承 |
@@ -381,12 +389,120 @@ Phase 1 の機能追加は工数が大きく、価値も漸進的。Phase 2 の*
 ## 12. 来歴・検証メタデータ
 
 - 解析・実装起点：`b25a63c74a` (`9.7-88-gb25a63c74a`)
-- ブランチ：`feature/mcp-fresh-macos`（`0834ec2610` → `36b0f04fb0` → `5129c6d773` → 本ハンドオフ commit）
+- ブランチ：`feature/mcp-fresh-macos`（`0834ec2610` → `36b0f04fb0` → `5129c6d773` → `2ea50d0292` → `458f99a63b` → `19853971f0`）
 - ビルド・検証マシン：Mac mini M4（arm64, 10 cores, macOS Apple clang 17, Homebrew 6.0.3）
-- 検証手法：static（dylib / nm / JSON 妥当性）＋ live（curl による MCP 疎通、Host header rejection、`track_get_meter` 実呼び出し）。詳細は §6.1。
+- 検証手法：static（dylib / nm / JSON 妥当性 / string table）＋ live（curl による MCP 疎通、Host header rejection、`track_get_meter` 実呼び出し）。Wave T1 はライブ Ardour なしのため static 確認のみ（`session/export_audio` 文字列・`session_export_audio` 文字列いずれも dylib string table に存在確認済み）。詳細は §6.1。
 - 補足設計レポート（リポ外、参考）：作業ホスト `/Volumes/work-ssd-4TB-USB4/_Git_Repository/llm-daw-report/` の PDF 4 部。**本ハンドオフはこれらに依存せず単体で完結**。
 - 本ハンドオフはエンジニアリング分析であり、ライセンス §9 は**法的助言ではない**（公開前に弁護士確認推奨）。
 
 ---
 
-*End of handoff. 次の LLM へ：§3 でビルド・起動・MCP 疎通を再現確認 → §8 から残作業を選ぶ。Phase 0（堅牢化）は完了し、安全な土台が出来ている。次は知覚ループ（Phase 2 が差別化価値最大）または in-app UX（Phase 3）が次の山。*
+## 13. Wave T1：`session/export_audio`（納品口を開ける）
+
+**コミット `19853971f07f6f81413b55a298487e5574efa98c`** — 2026-06-26 — `mcp_http: add session/export_audio — open the delivery port (T1)`
+
+### 13.1 ツール名とスキーマ
+
+`tools_json.inc` の追加エントリ（verbatim、行 142–186）:
+
+```json
+{
+  "name": "session_export_audio",
+  "title": "Export Audio",
+  "description": "Export the session master bus to an audio file and return metadata about the exported file. For the MVP only WAV (PCM) output is supported; FLAC, AIFF, and MP3 support may be added in a future release. The export runs in freewheel (offline) mode and blocks until complete. The caller must supply an absolute path for the output file; the parent directory must already exist. format defaults to \"wav\". sample_rate defaults to the session's nominal sample rate. sample_format may be \"PCM_16\" (default), \"PCM_24\", or \"FLOAT\". start_sec and length_sec define the export range in seconds; omit both to export the entire session. channels may be \"stereo\" (default) or \"mono\" (sums L+R from the master bus).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute filesystem path for the output file (e.g. /home/user/export/mix.wav). The parent directory must exist."
+      },
+      "format": {
+        "type": "string",
+        "enum": ["wav"],
+        "description": "Output file format. Only \"wav\" is supported in the MVP."
+      },
+      "sample_rate": {
+        "type": "number",
+        "description": "Sample rate in Hz (e.g. 44100, 48000). Defaults to the session nominal sample rate."
+      },
+      "sample_format": {
+        "type": "string",
+        "enum": ["PCM_16", "PCM_24", "FLOAT"],
+        "description": "PCM bit depth or float. Defaults to \"PCM_16\"."
+      },
+      "start_sec": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Export range start, in seconds from the session origin. Defaults to 0."
+      },
+      "length_sec": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "description": "Export range length in seconds. Defaults to the full session length."
+      },
+      "channels": {
+        "type": "string",
+        "enum": ["stereo", "mono"],
+        "description": "\"stereo\" exports L+R from the master bus. \"mono\" sums them."
+      }
+    },
+    "required": ["path"],
+    "additionalProperties": false
+  }
+}
+```
+
+**MCP tool name**（`canonical_tool_name` が `/` ↔ `_` 両形を受理する）：`session/export_audio` または `session_export_audio`。
+
+### 13.2 実装箇所
+
+| ファイル | 場所 | 役割 |
+|---|---|---|
+| `mcp_http_server.cc` | 行 4298–4575 | `handle_session_export_audio_tool()` — 引数解析・パイプライン構築・export 実行・結果返却 |
+| `mcp_http_server.cc` | 行 4633–4635 | `dispatch_session_tool_call()` に `"session/export_audio"` 分岐追加 |
+| `tools_json.inc` | 行 142–186 | スキーマ定義（`session_export_audio` エントリ）|
+| `wscript` | `uselib` に `SNDFILE` 追加 | `ExportFormatBase` 等が libsndfile を要求 |
+
+### 13.3 実装ウォークスルー
+
+`handle_session_export_audio_tool()` の処理ステップ（`mcp_http_server.cc:4298-4575`）：
+
+1. **引数解析・検証**（行 4302–4402）：`path`（必須・絶対パス・親ディレクトリ存在確認）、`format`（MVP: wav のみ）、`sample_rate`（`ExportFormatBase::SampleRate` 列挙への変換）、`sample_format`（`SF_16`/`SF_24`/`SF_Float`）、`start_sec`/`length_sec`（サンプル単位の `range_start`/`range_end` に変換）、`channels`（stereo/mono）。
+2. **マスターバス確認**（行 4405–4419）：`session.master_out()` でマスターバスを取得、`IO::n_ports().n_audio()` で出力ポート確認、`export_status()->running()` で二重起動を防止。
+3. **ExportFormatSpecification の構築**（行 4431–4458）：`handler->add_format()` → `ExportFormatTaggedLinear("WAV", F_WAV)` を組み立てて `spec->set_format()` で私有フラグ `_has_sample_format=true` をセット（これをしないと libsndfile が `SF_None` を受け取り無音ファイルになる）。SR、ビット深度、ディザ（16bit は D_Shaped）を設定。
+4. **ExportFilename の構築**（行 4466–4483）：`handler->add_filename()` → stem（`.wav` 拡張子を除去）を `set_label()` でセット後、副作用で `include_label=false` になるのを `include_label=true` で上書き。フォルダ・タイムスパン参照も設定。
+5. **ExportTimespan の構築**（行 4486–4491）：`handler->add_timespan()` → `set_range(range_start, range_end)`、`set_realtime(false)` でオフラインフリーホイールモード指定。
+6. **ExportChannelConfiguration の構築**（行 4497–4512）：mono の場合はマスターバスの全ポートを 1 つの `PortExportChannel` に積む、stereo の場合はポートごとに 1 チャンネル。
+7. **エクスポート開始**（行 4516–4521）：`handler->add_export_config(ts, chan_cfg, spec, fn, BroadcastInfoPtr())` → `handler->do_export()`。
+8. **イベントループポンプ**（行 4523–4548）：`while(status->running()) { gtk_main_iteration_do(false) || usleep(10ms) }`、10 分タイムアウトで `status->abort()` 後エラー返却。オーディオスレッドからのフリーホイールコールバックが GUI スレッドへ投函されるため、GTK イベントループのポンプが必須（`export_dialog.cc:410-418` と同型）。
+9. **後処理**（行 4550–4574）：`status->finish(TRS_UI)` でフリーホイール停止・状態リセット → `fn->get_path(spec)` で実際のファイルパスを取得 → `stat()` でファイルサイズ確認 → JSON 結果返却（`path`, `bytes`, `sampleRate`, `channels`, `durationSec`, `format`）。
+
+### 13.4 スレッドモデル
+
+`handle_session_export_audio_tool()` は `run_tools_call()` から呼ばれ、`run_tools_call()` は `_event_loop->call_slot()` 経由で**GUI/イベントループスレッド上で実行**される。
+
+フリーホイールエクスポートのコールバック（オーディオスレッド → GUI スレッド）を受け取るために、ハンドラ内で `gtk_main_iteration()` をポンプする必要がある。これは既存の `ExportDialog::show_progress()` と同じ手法（`export_dialog.cc:410-418`）。呼び出し側の lws スレッドは `condvar.wait()` でブロックしており、GUI スレッドが GTK をポンプしながらエクスポート完了を待つ。**10 分タイムアウト**はライブエクスポートが応答なしになった場合の安全弁。
+
+### 13.5 MVP の制限
+
+1. **WAV 専用**：libsndfile が対応する FLAC / AIFF / MP3 は未実装（`ExportFormatTaggedLinear` の `F_FLAC` 等を指定するだけで拡張可能）。
+2. **ブロッキング**：最大 10 分間 GUI スレッドをブロックする。T3（SSE）が実装されれば、非同期完了通知に切り替えられる。
+3. **マスターバス固定**：出力ソースはセッションのマスターバスのみ。ステム（個別トラック）エクスポートは未実装。
+4. **LUFS 解析なし**：`spec->set_analyse(false)` で loudness 解析をスキップ。将来 T3 連携で解析結果をプッシュ通知する拡張余地あり。
+
+### 13.6 スモーク検証結果
+
+- `errors=0`, `warnings=8`（macOS deployment target 不一致の既知警告のみ）
+- dylib `libardour_mcp_http.dylib` の string table に `session/export_audio`（count=1）と `session_export_audio`（count=1）が存在 → `tools_json.inc` がコンパイルに取り込まれていることを確認
+- Ardour 未起動のため live curl テスト（`tools/list` で 97 ツール確認、`session/export_audio` の実呼び出し）は未実施。次回起動時に §3.9 のパターンで確認すること。
+
+### 13.7 推奨次波
+
+- **T2（オートメーション曲線）**：ミックスの時間軸操作。依存なし。
+- **T3（SSE 通知）**：知覚ループ確立＋`session/export_audio` の非同期化に必要。
+- T3 → `session/export_audio` の非同期バージョン（`do_export` 後すぐ返却、完了時 SSE `notifications/export_complete` を送出）が理想形。
+
+---
+
+*End of handoff. 次の LLM へ：§3 でビルド・起動・MCP 疎通を再現確認 → §8 から残作業を選ぶ。Phase 0（堅牢化）は完了し、Wave T1（`session/export_audio`）で納品口が開いた。次は T2（オートメーション）または T3（SSE）が最優先候補。*
