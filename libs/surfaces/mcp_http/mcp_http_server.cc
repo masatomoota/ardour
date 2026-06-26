@@ -76,6 +76,25 @@
 #include "ardour/tempo.h"
 #include "ardour/track.h"
 
+#include "ardour/export_channel.h"
+#include "ardour/export_channel_configuration.h"
+#include "ardour/export_filename.h"
+#include "ardour/export_format_base.h"
+#include "ardour/export_format_specification.h"
+#include "ardour/export_formats.h"
+#include "ardour/export_handler.h"
+#include "ardour/export_status.h"
+#include "ardour/export_timespan.h"
+#include "ardour/io.h"
+
+#include <glibmm/fileutils.h>
+#include <glibmm/miscutils.h>
+#include <glibmm/main.h>
+#include <glibmm/timer.h>
+#include <ytk/ytk.h>
+
+#include <sys/stat.h>
+
 #include "mcp_http_server.h"
 
 namespace pt = boost::property_tree;
@@ -4276,6 +4295,286 @@ handle_session_store_mixer_scene_tool (ARDOUR::Session& session, const pt::ptree
 }
 
 static std::string
+handle_session_export_audio_tool (ARDOUR::Session& session, const pt::ptree& root, const std::string& id)
+{
+	using namespace ARDOUR;
+
+	/* ---- 1. Parse and validate arguments ---- */
+
+	/* path: required, absolute filesystem path for the output file */
+	const std::string path_arg = root.get<std::string> ("params.arguments.path", "");
+	if (path_arg.empty ()) {
+		return jsonrpc_error (id, -32602, "Missing required argument: path");
+	}
+	if (path_arg.find ('\0') != std::string::npos) {
+		return jsonrpc_error (id, -32602, "path must not contain NUL bytes");
+	}
+
+	/* Expand leading ~/ to $HOME */
+	std::string resolved_path = path_arg;
+	if (!resolved_path.empty () && resolved_path[0] == '~') {
+		const char* home = std::getenv ("HOME");
+		if (!home || resolved_path.size () < 2 || resolved_path[1] != '/') {
+			return jsonrpc_error (id, -32602, "path: cannot expand ~; provide an absolute path");
+		}
+		resolved_path = std::string (home) + resolved_path.substr (1);
+	}
+	if (!Glib::path_is_absolute (resolved_path)) {
+		return jsonrpc_error (id, -32602, "path must be absolute");
+	}
+
+	const std::string parent_dir = Glib::path_get_dirname (resolved_path);
+	if (!Glib::file_test (parent_dir, Glib::FILE_TEST_IS_DIR)) {
+		return jsonrpc_error (id, -32602,
+		    std::string ("path: parent directory does not exist: ") + parent_dir);
+	}
+
+	/* format: MVP supports only "wav" */
+	const std::string format_str = root.get<std::string> ("params.arguments.format", "wav");
+	if (format_str != "wav") {
+		return jsonrpc_error (id, -32602,
+		    std::string ("Unsupported format '") + format_str + "'; only \"wav\" is supported in the MVP");
+	}
+
+	/* sample_rate: default to session nominal rate */
+	const samplecnt_t session_sr     = session.nominal_sample_rate ();
+	const int64_t     sr_arg         = root.get<int64_t> ("params.arguments.sample_rate", (int64_t)session_sr);
+	if (sr_arg <= 0 || sr_arg > 384000) {
+		return jsonrpc_error (id, -32602, "sample_rate must be between 1 and 384000");
+	}
+
+	/* Map requested integer rate to the nearest ExportFormatBase::SampleRate enum value */
+	ExportFormatBase::SampleRate export_sr;
+	switch ((int)sr_arg) {
+		case 22050: export_sr = ExportFormatBase::SR_22_05; break;
+		case 24000: export_sr = ExportFormatBase::SR_24;    break;
+		case 44100: export_sr = ExportFormatBase::SR_44_1;  break;
+		case 48000: export_sr = ExportFormatBase::SR_48;    break;
+		case 88200: export_sr = ExportFormatBase::SR_88_2;  break;
+		case 96000: export_sr = ExportFormatBase::SR_96;    break;
+		case 176400: export_sr = ExportFormatBase::SR_176_4; break;
+		case 192000: export_sr = ExportFormatBase::SR_192;  break;
+		default:
+			return jsonrpc_error (id, -32602,
+			    "sample_rate must be one of: 22050, 24000, 44100, 48000, 88200, 96000, 176400, 192000");
+	}
+
+	/* sample_format: PCM_16 | PCM_24 | FLOAT, default PCM_16 */
+	const std::string sf_str = root.get<std::string> ("params.arguments.sample_format", "PCM_16");
+	ExportFormatBase::SampleFormat export_sf;
+	int export_bits;
+	if (sf_str == "PCM_16") {
+		export_sf   = ExportFormatBase::SF_16;
+		export_bits = 16;
+	} else if (sf_str == "PCM_24") {
+		export_sf   = ExportFormatBase::SF_24;
+		export_bits = 24;
+	} else if (sf_str == "FLOAT") {
+		export_sf   = ExportFormatBase::SF_Float;
+		export_bits = 32;
+	} else {
+		return jsonrpc_error (id, -32602,
+		    std::string ("Invalid sample_format '") + sf_str + "'; expected PCM_16, PCM_24, or FLOAT");
+	}
+
+	/* start_sec and length_sec */
+	const double start_sec_arg = root.get<double> ("params.arguments.start_sec", 0.0);
+	if (start_sec_arg < 0.0) {
+		return jsonrpc_error (id, -32602, "start_sec must be >= 0");
+	}
+	const samplepos_t session_end = session.current_end_sample ();
+	const samplepos_t range_start = (samplepos_t)(start_sec_arg * (double)session_sr + 0.5);
+
+	const double default_length_sec = (double)(session_end - range_start) / (double)session_sr;
+	const double length_sec_arg     = root.get<double> ("params.arguments.length_sec", default_length_sec);
+	if (length_sec_arg <= 0.0) {
+		return jsonrpc_error (id, -32602, "length_sec must be > 0");
+	}
+	const samplepos_t range_end = range_start + (samplepos_t)(length_sec_arg * (double)session_sr + 0.5);
+	if (range_end <= range_start) {
+		return jsonrpc_error (id, -32602, "Export range is empty (start >= end)");
+	}
+
+	/* channels: stereo | mono */
+	const std::string channels_str = root.get<std::string> ("params.arguments.channels", "stereo");
+	if (channels_str != "stereo" && channels_str != "mono") {
+		return jsonrpc_error (id, -32602, "channels must be \"stereo\" or \"mono\"");
+	}
+	const bool mono_mixdown = (channels_str == "mono");
+
+	/* ---- 2. Guard: master bus must exist and have audio outputs ---- */
+	std::shared_ptr<Route> master = session.master_out ();
+	if (!master) {
+		return jsonrpc_error (id, -32000, "Session has no master bus");
+	}
+	IO* master_io = master->output ().get ();
+	if (!master_io || master_io->n_ports ().n_audio () == 0) {
+		return jsonrpc_error (id, -32000, "Master bus has no audio output ports");
+	}
+
+	/* Guard: must not already be exporting */
+	const std::shared_ptr<ExportStatus> status = session.get_export_status ();
+	if (status->running ()) {
+		return jsonrpc_error (id, -32000, "An export is already in progress");
+	}
+
+	/* ---- 3. Build the export pipeline ---- */
+	const std::shared_ptr<ExportHandler> handler = session.get_export_handler ();
+	handler->reset ();
+
+	/* 3a. Build ExportFormatSpecification for WAV / requested SR & bit-depth.
+	 *     We MUST call set_format() with a proper ExportFormat object so that
+	 *     the private _has_sample_format flag is set inside the spec; without
+	 *     it, the graph builder passes SF_None (0) to libsndfile and the file
+	 *     open fails silently.  Construct ExportFormatTaggedLinear exactly as
+	 *     ExportFormatManager does (export_format_manager.cc:161-171). */
+	ExportFormatSpecPtr spec = handler->add_format ();
+	{
+		std::shared_ptr<ExportFormatTaggedLinear> wav_fmt =
+		    std::make_shared<ExportFormatTaggedLinear> ("WAV", ExportFormatBase::F_WAV);
+		wav_fmt->add_sample_format (ExportFormatBase::SF_U8);
+		wav_fmt->add_sample_format (ExportFormatBase::SF_16);
+		wav_fmt->add_sample_format (ExportFormatBase::SF_24);
+		wav_fmt->add_sample_format (ExportFormatBase::SF_32);
+		wav_fmt->add_sample_format (ExportFormatBase::SF_Float);
+		wav_fmt->add_sample_format (ExportFormatBase::SF_Double);
+		wav_fmt->add_endianness (ExportFormatBase::E_Little);
+		wav_fmt->set_default_sample_format (ExportFormatBase::SF_16);
+		wav_fmt->set_extension ("wav");
+		spec->set_format (wav_fmt); /* sets T_Sndfile, F_WAV, _has_sample_format=true */
+	}
+	spec->set_sample_rate   (export_sr);
+	spec->set_sample_format (export_sf);
+	if (export_sf == ExportFormatBase::SF_16) {
+		spec->set_dither_type (ExportFormatBase::D_Shaped); /* triangular noise shaping for 16-bit */
+	} else {
+		spec->set_dither_type (ExportFormatBase::D_None);
+	}
+	spec->set_name    ("MCP WAV Export");
+	spec->set_analyse (false); /* skip loudness analysis */
+
+	if (!spec->is_complete ()) {
+		return jsonrpc_error (id, -32000, "Internal error: export format specification is incomplete");
+	}
+
+	/* 3b. Build ExportFilename.
+	 *     We split the caller-supplied path into folder + stem so that
+	 *     ExportFilename::get_path() reassembles it as folder/stem.wav.
+	 *     set_label() has a quirky side-effect that sets include_label to
+	 *     false when the value is non-empty, so we override include_label
+	 *     back to true immediately after. */
+	ExportFilenamePtr fn = handler->add_filename ();
+
+	/* Strip a trailing .wav extension from the basename if the caller
+	 * provided one (get_path always appends it from the format spec). */
+	std::string basename = Glib::path_get_basename (resolved_path);
+	if (basename.size () > 4 &&
+	    (basename.substr (basename.size () - 4) == ".wav" ||
+	     basename.substr (basename.size () - 4) == ".WAV")) {
+		basename = basename.substr (0, basename.size () - 4);
+	}
+	fn->set_label (basename);     /* stores label text; incidentally sets include_label=false */
+	fn->include_label    = true;  /* override the side-effect */
+	fn->include_session  = false;
+	fn->include_timespan = false;
+	fn->include_revision = false;
+	fn->include_date     = false;
+	fn->include_time     = false;
+	fn->set_folder (parent_dir);
+
+	/* 3c. Build ExportTimespan */
+	ExportTimespanPtr ts = handler->add_timespan ();
+	ts->set_name     ("session");
+	ts->set_range_id ("session");
+	ts->set_range    (range_start, range_end);
+	ts->set_realtime (false); /* freewheel / offline mode */
+	fn->set_timespan (ts);
+
+	/* 3d. Build ExportChannelConfiguration wired to master bus outputs.
+	 *     For mono mixdown, create a single PortExportChannel that holds
+	 *     both L and R ports; audiographer will sum them.  For stereo,
+	 *     create one channel per port (standard L + R pair). */
+	ExportChannelConfigPtr chan_cfg = handler->add_channel_config ();
+	chan_cfg->set_name (mono_mixdown ? "mono" : "stereo");
+	const uint32_t n_master_ports = master_io->n_ports ().n_audio ();
+	if (mono_mixdown) {
+		PortExportChannel* ch = new PortExportChannel ();
+		for (uint32_t n = 0; n < n_master_ports; ++n) {
+			ch->add_port (master_io->audio (n));
+		}
+		chan_cfg->register_channel (ExportChannelPtr (ch));
+	} else {
+		for (uint32_t n = 0; n < n_master_ports; ++n) {
+			PortExportChannel* ch = new PortExportChannel ();
+			ch->add_port (master_io->audio (n));
+			chan_cfg->register_channel (ExportChannelPtr (ch));
+		}
+	}
+	const uint32_t out_channels = mono_mixdown ? 1 : n_master_ports;
+
+	/* 3e. Register config and kick off freewheel export */
+	handler->add_export_config (ts, chan_cfg, spec, fn, BroadcastInfoPtr ());
+
+	const int do_ret = handler->do_export ();
+	if (do_ret < 0) {
+		return jsonrpc_error (id, -32000, "ExportHandler::do_export() failed to start");
+	}
+
+	/* ---- 4. Pump the GTK event loop while freewheeling ---- */
+	/* We are on the GUI/event-loop thread.  We MUST call gtk_main_iteration()
+	 * to allow freewheel ProcessExport callbacks (which arrive on the audio
+	 * thread and post work back to the GUI thread) to proceed.  This mirrors
+	 * ExportDialog::show_progress() (export_dialog.cc:410-418). */
+	const std::chrono::steady_clock::time_point export_deadline =
+	    std::chrono::steady_clock::now () + std::chrono::minutes (10);
+
+	while (status->running ()) {
+		if (gtk_events_pending ()) {
+			gtk_main_iteration ();
+		} else {
+			Glib::usleep (10000); /* 10 ms */
+		}
+		if (std::chrono::steady_clock::now () >= export_deadline) {
+			status->abort (true);
+			while (status->running ()) {
+				if (gtk_events_pending ()) {
+					gtk_main_iteration ();
+				} else {
+					Glib::usleep (10000);
+				}
+			}
+			return jsonrpc_error (id, -32000, "Export timed out after 10 minutes");
+		}
+	}
+
+	/* ---- 5. Finalise: emit Finished → Session::finalize_audio_export ---- */
+	if (status->aborted ()) {
+		return jsonrpc_error (id, -32000, "Export was aborted or failed");
+	}
+	status->finish (TRS_UI); /* stops freewheeling, resets handler/status, restores sync */
+
+	/* ---- 6. Stat the output file and build the result ---- */
+	const std::string out_path = fn->get_path (spec);
+	struct stat st {};
+	::stat (out_path.c_str (), &st);
+	const double duration_sec = length_sec_arg;
+
+	std::ostringstream structured;
+	structured << "{\"path\":\"" << json_escape (out_path) << "\""
+	           << ",\"bytes\":" << (int64_t)st.st_size
+	           << ",\"sampleRate\":" << (int64_t)sr_arg
+	           << ",\"channels\":" << out_channels
+	           << ",\"durationSec\":" << duration_sec
+	           << ",\"format\":\"wav\""
+	           << "}";
+
+	return jsonrpc_result (
+	    id,
+	    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"Audio exported to: ") +
+	        json_escape (out_path) + "\"}],\"structuredContent\":" + structured.str () + "}");
+}
+
+static std::string
 handle_session_recall_mixer_scene_tool (ARDOUR::Session& session, const pt::ptree& root, const std::string& id)
 {
 	const int64_t index_in = root.get<int64_t> ("params.arguments.index", -1);
@@ -4329,6 +4628,10 @@ dispatch_session_tool_call (ARDOUR::Session& session, const std::string& tool_na
 	}
 	if (tool_name == "session/recall_mixer_scene") {
 		response = handle_session_recall_mixer_scene_tool (session, root, id);
+		return true;
+	}
+	if (tool_name == "session/export_audio") {
+		response = handle_session_export_audio_tool (session, root, id);
 		return true;
 	}
 

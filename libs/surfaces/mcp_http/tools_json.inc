@@ -140,6 +140,51 @@ R"mcp(
       }
     },
     {
+      "name": "session_export_audio",
+      "title": "Export Audio",
+      "description": "Export the session master bus to an audio file and return metadata about the exported file. For the MVP only WAV (PCM) output is supported; FLAC, AIFF, and MP3 support may be added in a future release. The export runs in freewheel (offline) mode and blocks until complete. The caller must supply an absolute path for the output file; the parent directory must already exist. format defaults to \"wav\". sample_rate defaults to the session's nominal sample rate. sample_format may be \"PCM_16\" (default), \"PCM_24\", or \"FLOAT\". start_sec and length_sec define the export range in seconds; omit both to export the entire session. channels may be \"stereo\" (default) or \"mono\" (sums L+R from the master bus).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute filesystem path for the output file (e.g. /home/user/export/mix.wav). The parent directory must exist."
+          },
+          "format": {
+            "type": "string",
+            "enum": ["wav"],
+            "description": "Output file format. Only \"wav\" is supported in the MVP."
+          },
+          "sample_rate": {
+            "type": "number",
+            "description": "Sample rate in Hz (e.g. 44100, 48000). Defaults to the session nominal sample rate."
+          },
+          "sample_format": {
+            "type": "string",
+            "enum": ["PCM_16", "PCM_24", "FLOAT"],
+            "description": "PCM bit depth or float. Defaults to \"PCM_16\"."
+          },
+          "start_sec": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Export range start, in seconds from the session origin. Defaults to 0."
+          },
+          "length_sec": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Export range length in seconds. Defaults to the full session length."
+          },
+          "channels": {
+            "type": "string",
+            "enum": ["stereo", "mono"],
+            "description": "\"stereo\" exports L+R from the master bus. \"mono\" sums them."
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "transport_get_state",
       "title": "Transport State",
       "description": "Return transport state (rolling, speed, sample, state).",

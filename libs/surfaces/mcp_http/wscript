@@ -20,6 +20,6 @@ def build(bld):
     obj.includes     = ['.', './mcp_http']
     obj.name         = 'libardour_mcp_http'
     obj.target       = 'ardour_mcp_http'
-    obj.uselib       = 'OSX GLIBMM GIOMM PANGOMM XML WEBSOCKETS OPENSSL'
+    obj.uselib       = 'OSX GLIBMM GIOMM PANGOMM XML WEBSOCKETS OPENSSL ARCHIVE SIGCPP ATKMM'
     obj.use          = 'libardour libardour_cp libgtkmm2ext libpbd libytkmm'
     obj.install_path = os.path.join(bld.env['LIBDIR'], 'surfaces')
