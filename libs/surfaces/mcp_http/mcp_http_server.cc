@@ -44,8 +44,12 @@
 #include "pbd/id.h"
 #include "pbd/memento_command.h"
 #include "pbd/pthread_utils.h"
+#include "pbd/signals.h"
 #include "pbd/stateful_diff_command.h"
 #include "pbd/xml++.h"
+
+#include "ardour/session.h"
+#include "ardour/types.h"
 
 #include "ardour/amp.h"
 #include "ardour/audio_track.h"
@@ -3037,6 +3041,7 @@ MCPHttpServer::MCPHttpServer (ARDOUR::Session& session, uint16_t port, int debug
 	, _event_loop (event_loop)
 	, _context (0)
 	, _running (false)
+	, _sse_last_heartbeat (0)
 {
 	memset (_protocols, 0, sizeof (_protocols));
 	memset (&_info, 0, sizeof (_info));
@@ -3080,6 +3085,12 @@ MCPHttpServer::start ()
 		return -1;
 	}
 
+	/* Connect PBD transport signals so that SSE clients receive
+	 * notifications/transport events on play/stop/record state changes.
+	 * The slots are marshalled onto _event_loop (the GUI thread) via the
+	 * cross-thread connect() overload before reading Session state. */
+	connect_transport_signals ();
+
 	_running        = true;
 	_service_thread = std::thread (&MCPHttpServer::run, this);
 
@@ -3094,10 +3105,23 @@ MCPHttpServer::stop ()
 	}
 
 	_running = false;
+
+	/* Tear down PBD signal subscriptions before stopping the service thread
+	 * so that no in-flight on_transport_state_changed() call can call
+	 * lws_cancel_service on a being-destroyed context. */
+	_sse_signal_connections.drop_connections ();
+
 	lws_cancel_service (_context);
 
 	if (_service_thread.joinable ()) {
 		_service_thread.join ();
+	}
+
+	/* Clear subscriber list under lock; the service thread is joined above
+	 * so no concurrent access remains, but the mutex keeps TSAN happy. */
+	{
+		std::lock_guard<std::mutex> lk (_sse_subscribers_mutex);
+		_sse_subscribers.clear ();
 	}
 
 	lws_context_destroy (_context);
@@ -3142,10 +3166,10 @@ MCPHttpServer::client (struct lws* wsi)
 {
 	ClientMap::iterator it = _clients.find (wsi);
 	if (it == _clients.end ()) {
-		ClientContext ctx;
-		ctx.mcp_post      = false;
-		ctx.have_response = false;
-		it                = _clients.emplace (wsi, ctx).first;
+		auto res          = _clients.try_emplace (wsi);
+		it                = res.first;
+		it->second.mcp_post      = false;
+		it->second.have_response = false;
 	}
 
 	return it->second;
@@ -3154,6 +3178,22 @@ MCPHttpServer::client (struct lws* wsi)
 void
 MCPHttpServer::erase_client (struct lws* wsi)
 {
+	/* Remove from SSE subscriber list first (under its own mutex) before
+	 * erasing the ClientContext so broadcast_sse cannot enqueue to a dead wsi. */
+	{
+		std::lock_guard<std::mutex> lk (_sse_subscribers_mutex);
+		_sse_subscribers.erase (
+		    std::remove_if (_sse_subscribers.begin (), _sse_subscribers.end (),
+		                    [wsi] (SseSubscriber* s) {
+			                    bool match = (s->wsi == wsi);
+			                    if (match) {
+				                    delete s;
+			                    }
+			                    return match;
+		                    }),
+		    _sse_subscribers.end ());
+	}
+
 	ClientMap::iterator it = _clients.find (wsi);
 	if (it != _clients.end ()) {
 		_clients.erase (it);
@@ -3203,6 +3243,47 @@ MCPHttpServer::handle_http (struct lws* wsi, ClientContext& ctx)
 		/* HTTP-only MCP endpoint: POST /mcp */
 		if (path == "/mcp") {
 			return send_http_status (wsi, 405);
+		}
+
+		/* SSE push notification endpoint.
+		 * Apply the same DNS-rebinding defence as POST /mcp: reject any
+		 * Host header that is not a loopback address. */
+		if (path == "/events") {
+			char host[256];
+			int  hlen = lws_hdr_copy (wsi, host, sizeof (host), WSI_TOKEN_HOST);
+			if (hlen > 0 && !host_header_is_loopback (host)) {
+				return send_http_status (wsi, 403);
+			}
+
+			if (send_sse_headers (wsi)) {
+				return 1;
+			}
+
+			/* Register this wsi as an SSE subscriber. */
+			SseSubscriber* sub = new SseSubscriber ();
+			sub->wsi = wsi;
+			{
+				std::lock_guard<std::mutex> lk (_sse_subscribers_mutex);
+				_sse_subscribers.push_back (sub);
+			}
+
+			ctx.sse_client = true;
+
+			/* Arm a 15-second heartbeat timer for this connection. */
+			lws_set_timer_usecs (wsi, 15 * LWS_USEC_PER_SEC);
+
+			/* Send a snapshot of the current transport state immediately
+			 * so the client knows the baseline without waiting for an edge. */
+			const std::string initial_frame = build_transport_event ();
+			{
+				std::lock_guard<std::mutex> qlk (ctx.sse_queue_mutex);
+				ctx.sse_queue.push_back (initial_frame);
+			}
+			lws_callback_on_writable (wsi);
+
+			/* Return 0 to keep the connection alive.
+			 * Do NOT call lws_http_transaction_completed(). */
+			return 0;
 		}
 
 		return send_http_status (wsi, 404);
@@ -3264,12 +3345,186 @@ MCPHttpServer::handle_http_body_completion (struct lws* wsi, ClientContext& ctx)
 int
 MCPHttpServer::handle_http_writeable (struct lws* wsi, ClientContext& ctx)
 {
+	if (ctx.sse_client) {
+		/* Drain the SSE queue — at most a few frames per callback to avoid
+		 * blocking the lws service thread for an extended time. */
+		const int max_frames_per_cb = 4;
+		int       frames_written    = 0;
+		{
+			std::lock_guard<std::mutex> lk (ctx.sse_queue_mutex);
+			while (!ctx.sse_queue.empty () && frames_written < max_frames_per_cb) {
+				std::string& frame = ctx.sse_queue.front ();
+				const int    n     = lws_write (wsi,
+				                                reinterpret_cast<unsigned char*> (&frame[0]),
+				                                frame.size (),
+				                                LWS_WRITE_HTTP);
+				if (n < 0) {
+					/* Write error — close the connection. */
+					return 1;
+				}
+				ctx.sse_queue.pop_front ();
+				++frames_written;
+			}
+			if (!ctx.sse_queue.empty ()) {
+				/* More frames remain; re-arm the writable callback. */
+				lws_callback_on_writable (wsi);
+			}
+		}
+		return 0;
+	}
+
 	if (ctx.have_response) {
 		return write_json_response (wsi, ctx);
 	}
 
 	return 0;
 }
+
+/* ── SSE helper: send HTTP 200 + text/event-stream headers ──────────────── */
+int
+MCPHttpServer::send_sse_headers (struct lws* wsi)
+{
+	unsigned char  out_buf[LWS_RECOMMENDED_MIN_HEADER_SPACE];
+	unsigned char* start = out_buf;
+	unsigned char* p     = start;
+	unsigned char* end   = &out_buf[sizeof (out_buf) - 1];
+
+#if LWS_LIBRARY_VERSION_MAJOR >= 3
+	/* LWS_ILLEGAL_HTTP_CONTENT_LEN omits Content-Length, required for a
+	 * streaming response that has no predetermined length. */
+	if (lws_add_http_common_headers (wsi, HTTP_STATUS_OK, "text/event-stream",
+	                                 LWS_ILLEGAL_HTTP_CONTENT_LEN, &p, end)
+	    || lws_add_http_header_by_token (wsi, WSI_TOKEN_HTTP_CACHE_CONTROL,
+	                                     reinterpret_cast<const unsigned char*> ("no-cache"), 8, &p, end)
+	    || lws_add_http_header_by_token (wsi, WSI_TOKEN_CONNECTION,
+	                                     reinterpret_cast<const unsigned char*> ("keep-alive"), 10, &p, end)
+	    || lws_finalize_write_http_header (wsi, start, &p, end)) {
+		return 1;
+	}
+#else
+	if (lws_add_http_header_status (wsi, 200, &p, end)
+	    || lws_add_http_header_by_token (wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
+	                                     reinterpret_cast<const unsigned char*> ("text/event-stream"), 17, &p, end)
+	    || lws_add_http_header_by_token (wsi, WSI_TOKEN_CONNECTION,
+	                                     reinterpret_cast<const unsigned char*> ("keep-alive"), 10, &p, end)
+	    || lws_add_http_header_by_token (wsi, WSI_TOKEN_HTTP_CACHE_CONTROL,
+	                                     reinterpret_cast<const unsigned char*> ("no-cache"), 8, &p, end)
+	    || lws_finalize_http_header (wsi, &p, end)) {
+		return 1;
+	}
+	int hdr_len = p - start;
+	if (lws_write (wsi, start, hdr_len, LWS_WRITE_HTTP_HEADERS) != hdr_len) {
+		return 1;
+	}
+#endif
+
+	/* Do NOT call lws_http_transaction_completed() — the connection must
+	 * remain open for the duration of the SSE stream. */
+	return 0;
+}
+
+/* ── SSE helper: build the current transport state as an SSE data frame ─── */
+std::string
+MCPHttpServer::build_transport_event () const
+{
+	const bool        rolling   = _session.transport_rolling ();
+	const bool        recording = _session.actively_recording ();
+	const bool        looping   = _session.get_play_loop ();
+	const samplepos_t        pos = _session.transport_sample ();
+	const ARDOUR::samplecnt_t sr = _session.sample_rate ();
+
+	const char* state_str = recording ? "recording"
+	                        : looping  ? "looping"
+	                        : rolling  ? "playing"
+	                                   : "stopped";
+
+	char buf[512];
+	snprintf (buf, sizeof (buf),
+	          "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/transport\","
+	          "\"params\":{\"state\":\"%s\",\"position_samples\":%lld,"
+	          "\"position_seconds\":%.6f,\"sample_rate\":%lld}}",
+	          state_str,
+	          (long long)pos,
+	          (sr > 0) ? ((double)pos / (double)sr) : 0.0,
+	          (long long)sr);
+
+	return std::string ("data: ") + buf + "\n\n";
+}
+
+/* ── SSE helper: broadcast a pre-formatted frame to all SSE subscribers ─── */
+void
+MCPHttpServer::broadcast_sse (const std::string& sse_frame)
+{
+	/* This method may be called from the GUI event-loop thread (when invoked
+	 * from on_transport_state_changed()) or from the lws service thread.
+	 * Iteration is done under _sse_subscribers_mutex; per-wsi queue writes
+	 * are done under each subscriber's ClientContext::sse_queue_mutex. */
+	std::vector<struct lws*> targets;
+	{
+		std::lock_guard<std::mutex> lk (_sse_subscribers_mutex);
+		for (SseSubscriber* s : _sse_subscribers) {
+			targets.push_back (s->wsi);
+		}
+	}
+
+	for (struct lws* wsi : targets) {
+		ClientMap::iterator it = _clients.find (wsi);
+		if (it == _clients.end ()) {
+			continue;
+		}
+		ClientContext& ctx = it->second;
+		{
+			std::lock_guard<std::mutex> qlk (ctx.sse_queue_mutex);
+			ctx.sse_queue.push_back (sse_frame);
+		}
+		/* lws_callback_on_writable is safe to call from a non-service thread
+		 * in lws >= 3.x (sets an atomic writable flag). */
+		lws_callback_on_writable (wsi);
+	}
+
+	if (!targets.empty () && _context) {
+		/* lws_cancel_service is explicitly documented thread-safe and wakes
+		 * the poll loop immediately (lws-service.h:87-88). */
+		lws_cancel_service (_context);
+	}
+}
+
+/* ── SSE helper: PBD signal handler, runs on GUI event-loop thread ────────
+ * Subscribed via the cross-thread connect() overload so it is always
+ * marshalled to _event_loop before execution — never on the process/butler
+ * thread that fires TransportStateChange. */
+void
+MCPHttpServer::on_transport_state_changed ()
+{
+	const std::string frame = build_transport_event ();
+	broadcast_sse (frame);
+}
+
+/* ── SSE helper: connect Session PBD signals ──────────────────────────────
+ * Called from start() after the lws context is created. */
+void
+MCPHttpServer::connect_transport_signals ()
+{
+	if (!_event_loop) {
+		/* Without an event loop we cannot safely marshal the signal onto a
+		 * non-process thread — skip signal connections. */
+		PBD::warning << "MCPHttp: no event loop available; SSE transport notifications disabled" << endmsg;
+		return;
+	}
+
+	_session.TransportStateChange.connect (
+	    _sse_signal_connections,
+	    MISSING_INVALIDATOR,
+	    std::bind (&MCPHttpServer::on_transport_state_changed, this),
+	    _event_loop);
+
+	_session.RecordStateChanged.connect (
+	    _sse_signal_connections,
+	    MISSING_INVALIDATOR,
+	    std::bind (&MCPHttpServer::on_transport_state_changed, this),
+	    _event_loop);
+}
+
 
 int
 MCPHttpServer::send_http_status (struct lws* wsi, unsigned int status)
@@ -8557,6 +8812,27 @@ MCPHttpServer::callback (struct lws* wsi, enum lws_callback_reasons reason, void
 			break;
 		case LWS_CALLBACK_HTTP_WRITEABLE:
 			rc = handle_http_writeable (wsi, ctx);
+			break;
+		case LWS_CALLBACK_TIMER:
+			/* Per-wsi 15-second heartbeat for SSE connections.
+			 * Send an SSE comment line (': heartbeat\n\n') so proxies and
+			 * browsers do not time out the connection. Then re-arm the timer. */
+			if (ctx.sse_client) {
+				const char hb[]  = ": heartbeat\n\n";
+				const int  hblen = (int)(sizeof (hb) - 1);
+				/* Write directly on the service thread — no queue needed. */
+				if (lws_write (wsi,
+				               reinterpret_cast<unsigned char*> (const_cast<char*> (hb)),
+				               hblen,
+				               LWS_WRITE_HTTP) == hblen) {
+					/* Re-arm; lws-callbacks.h:800 states this must be done from
+					 * within LWS_CALLBACK_TIMER to repeat. */
+					lws_set_timer_usecs (wsi, 15 * LWS_USEC_PER_SEC);
+				}
+				/* If lws_write fails the wsi is broken; do not re-arm and
+				 * let the CLOSED callback clean up. */
+			}
+			rc = 0;
 			break;
 		case LWS_CALLBACK_CLOSED:
 #ifdef LWS_CALLBACK_CLOSED_HTTP

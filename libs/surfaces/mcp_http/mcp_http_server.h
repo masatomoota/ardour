@@ -20,12 +20,19 @@
 #define _ardour_surface_mcp_http_server_h_
 
 #include <atomic>
+#include <ctime>
+#include <deque>
+#include <mutex>
+#include <set>
 #include <stdint.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <libwebsockets.h>
+
+#include "pbd/signals.h"
 
 namespace PBD
 {
@@ -57,7 +64,16 @@ private:
 		bool        have_response;
 		std::string request_body;
 		std::string response_body;
+		/* SSE-specific fields */
+		bool                    sse_client = false;
+		std::deque<std::string> sse_queue;
+		std::mutex              sse_queue_mutex;
 	};
+
+	struct SseSubscriber {
+		struct lws* wsi;
+	};
+	typedef std::vector<SseSubscriber*> SseSubscriberList;
 
 	typedef std::unordered_map<struct lws*, ClientContext> ClientMap;
 
@@ -71,6 +87,16 @@ private:
 	ClientMap                        _clients;
 	std::thread                      _service_thread;
 	bool                             _running;
+
+	/* SSE subscriber registry — protected by _sse_subscribers_mutex.
+	 * Entries are inserted on LWS_CALLBACK_HTTP (/events) and removed on
+	 * LWS_CALLBACK_CLOSED_HTTP, both of which run on the lws service thread.
+	 * broadcast_sse() may be called from the GUI event-loop thread and
+	 * only reads the list under the mutex before calling lws_cancel_service. */
+	SseSubscriberList                _sse_subscribers;
+	std::mutex                       _sse_subscribers_mutex;
+	PBD::ScopedConnectionList        _sse_signal_connections;
+	time_t                           _sse_last_heartbeat;
 
 	void run ();
 
@@ -86,6 +112,13 @@ private:
 	int send_json_headers (struct lws*);
 	int send_http_status (struct lws*, unsigned int);
 	int write_json_response (struct lws*, ClientContext&);
+
+	/* SSE helpers */
+	int         send_sse_headers (struct lws*);
+	void        broadcast_sse (const std::string& sse_frame);
+	void        on_transport_state_changed ();
+	std::string build_transport_event () const;
+	void        connect_transport_signals ();
 
 	std::string dispatch_jsonrpc (const std::string&) const;
 
