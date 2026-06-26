@@ -2883,6 +2883,99 @@ R"mcp(
       }
     },
     {
+      "name": "automation_get_lane",
+      "title": "Get Automation Lane",
+      "description": "Return all control points and current mode for an automation lane on a route. Supported parameters: gain, pan, mute, solo, rec_enable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Route MCP id (PBD::ID as decimal string)"
+          },
+          "parameter": {
+            "type": "string",
+            "enum": ["gain", "pan", "mute", "solo", "rec_enable"],
+            "description": "Automation parameter name"
+          }
+        },
+        "required": ["id", "parameter"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "automation_set_curve",
+      "title": "Set Automation Curve",
+      "description": "Replace all control points on an automation lane with the provided list (mode=replace). Points are specified as seconds from session start plus a parameter value in internal units (gain: 0.0-2.0 linear, pan: 0.0-1.0, mute/solo/rec_enable: 0.0 or 1.0). The operation is undoable as a single step.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Route MCP id"
+          },
+          "parameter": {
+            "type": "string",
+            "enum": ["gain", "pan", "mute", "solo", "rec_enable"],
+            "description": "Automation parameter name"
+          },
+          "points": {
+            "type": "array",
+            "description": "Control points in ascending time order. May be empty to clear the lane.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "timeSec": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Time position in seconds from session start"
+                },
+                "value": {
+                  "type": "number",
+                  "description": "Parameter value in internal units"
+                }
+              },
+              "required": ["timeSec", "value"],
+              "additionalProperties": false
+            }
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["replace"],
+            "description": "Edit mode. Only 'replace' (clear then add) is supported in this version."
+          }
+        },
+        "required": ["id", "parameter", "points"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "automation_set_mode",
+      "title": "Set Automation Mode",
+      "description": "Set the automation playback/record mode for a parameter on a route. Use 'play' (or 'read') to play back recorded automation, 'write' to record all moves, 'touch' to record only while touching, 'latch' to latch written values, 'off' to disable automation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Route MCP id"
+          },
+          "parameter": {
+            "type": "string",
+            "enum": ["gain", "pan", "mute", "solo", "rec_enable"],
+            "description": "Automation parameter name"
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["off", "play", "read", "touch", "write", "latch"],
+            "description": "Automation mode. 'read' is accepted as an alias for 'play'."
+          }
+        },
+        "required": ["id", "parameter", "mode"],
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "midi_region_add_samples",
       "title": "Add MIDI Region By Samples",
       "description": "Create an empty MIDI region on a MIDI track using absolute sample positions.",

@@ -256,7 +256,8 @@ canonical_tool_name (std::string tool_name)
 		"region",
 		"plugin",
 		"midi_region",
-		"midi_note"
+		"midi_note",
+		"automation"
 	};
 
 	for (size_t i = 0; i < (sizeof (known_groups) / sizeof (known_groups[0])); ++i) {
@@ -8587,6 +8588,348 @@ handle_region_move_tool (ARDOUR::Session& session, pt::ptree& root, const std::s
 	    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"") + (moved ? "Region moved" : "Region unchanged") + "\"}],\"structuredContent\":" + structured.str () + "}");
 }
 
+/* Map an MCP parameter name string to an Evoral::Parameter.
+ * Returns a Parameter with type NullAutomation (0) on failure and
+ * sets err. Caller must also null-check the resulting control via
+ * get_route_automation_control() because pan/rec_enable may not apply. */
+static Evoral::Parameter
+resolve_automation_parameter (const std::string& name, std::string& err)
+{
+	using namespace ARDOUR;
+	if (name == "gain")       { return Evoral::Parameter (GainAutomation,       0, 0); }
+	if (name == "pan")        { return Evoral::Parameter (PanAzimuthAutomation, 0, 0); }
+	if (name == "mute")       { return Evoral::Parameter (MuteAutomation,       0, 0); }
+	if (name == "solo")       { return Evoral::Parameter (SoloAutomation,       0, 0); }
+	if (name == "rec_enable") { return Evoral::Parameter (RecEnableAutomation,  0, 0); }
+	err = "Unknown parameter '" + name + "'. Accepted: gain, pan, mute, solo, rec_enable.";
+	return Evoral::Parameter (NullAutomation, 0, 0);
+}
+
+/* Retrieve the AutomationControl for a resolved parameter on a route.
+ * Returns nullptr when the parameter does not apply to this route
+ * (e.g. pan on a mono route, rec_enable on a bus). */
+static std::shared_ptr<ARDOUR::AutomationControl>
+get_route_automation_control (std::shared_ptr<ARDOUR::Route> route,
+                              const Evoral::Parameter&       param)
+{
+	using namespace ARDOUR;
+	switch (static_cast<AutomationType> (param.type ())) {
+	case GainAutomation:
+		return route->gain_control ();
+	case PanAzimuthAutomation:
+		return route->pan_azimuth_control (); /* nullptr if no panner */
+	case MuteAutomation:
+		return route->mute_control ();
+	case SoloAutomation:
+		return route->solo_control ();
+	case RecEnableAutomation: {
+		const std::shared_ptr<ARDOUR::Track> t =
+		    std::dynamic_pointer_cast<ARDOUR::Track> (route);
+		if (!t) { return {}; }
+		return t->rec_enable_control ();
+	}
+	default:
+		return {};
+	}
+}
+
+/* Convert an ARDOUR::AutoState to its MCP string representation. */
+static std::string
+auto_state_to_mcp_string (ARDOUR::AutoState s)
+{
+	switch (s) {
+	case ARDOUR::Off:   return "off";
+	case ARDOUR::Play:  return "play";
+	case ARDOUR::Touch: return "touch";
+	case ARDOUR::Write: return "write";
+	case ARDOUR::Latch: return "latch";
+	default:            return "off";
+	}
+}
+
+/* Convert an MCP mode string to ARDOUR::AutoState.
+ * Returns false and sets err on unknown input.
+ * Accepts "read" as an alias for "play" per AutoState semantics. */
+static bool
+mcp_string_to_auto_state (const std::string& s, ARDOUR::AutoState& out, std::string& err)
+{
+	if (s == "off")            { out = ARDOUR::Off;   return true; }
+	if (s == "play" || s == "read") { out = ARDOUR::Play;  return true; }
+	if (s == "touch")          { out = ARDOUR::Touch; return true; }
+	if (s == "write")          { out = ARDOUR::Write; return true; }
+	if (s == "latch")          { out = ARDOUR::Latch; return true; }
+	err = "Unknown mode '" + s + "'. Accepted: off, play/read, touch, write, latch.";
+	return false;
+}
+
+/* Return all control points of an automation lane for a named parameter on a route.
+ *
+ * Required args: id (route MCP id), parameter ("gain"|"pan"|"mute"|"solo"|"rec_enable")
+ * Structured output: routeId, parameter, automationState, sampleRate, pointCount,
+ *                    lower, upper, points ([{timeSec, timeSamples, value}]) */
+static std::string
+handle_automation_get_lane_tool (ARDOUR::Session& session, const pt::ptree& root, const std::string& id)
+{
+	const std::string route_id  = root.get<std::string> ("params.arguments.id", "");
+	const std::string param_str = root.get<std::string> ("params.arguments.parameter", "");
+
+	if (route_id.empty ()) {
+		return jsonrpc_error (id, -32602, "Missing route id");
+	}
+	if (param_str.empty ()) {
+		return jsonrpc_error (id, -32602, "Missing parameter");
+	}
+
+	const std::shared_ptr<ARDOUR::Route> route = route_by_mcp_id (session, route_id);
+	if (!route) {
+		return jsonrpc_error (id, -32602, "Route not found");
+	}
+
+	std::string          param_err;
+	const Evoral::Parameter param = resolve_automation_parameter (param_str, param_err);
+	if (param.type () == ARDOUR::NullAutomation) {
+		return jsonrpc_error (id, -32602, param_err);
+	}
+
+	const std::shared_ptr<ARDOUR::AutomationControl> ctrl =
+	    get_route_automation_control (route, param);
+	if (!ctrl) {
+		return jsonrpc_error (id, -32602, "Parameter not available on this route");
+	}
+
+	const std::shared_ptr<ARDOUR::AutomationList> alist = ctrl->alist ();
+	if (!alist) {
+		return jsonrpc_error (id, -32000, "No automation list for parameter");
+	}
+
+	const ARDOUR::samplecnt_t sr  = session.sample_rate ();
+	const ARDOUR::AutoState astate = alist->automation_state ();
+	const double lower            = alist->descriptor ().lower;
+	const double upper            = alist->descriptor ().upper;
+
+	std::ostringstream points_ss;
+	size_t             point_count = 0;
+	points_ss << "[";
+	{
+		PBD::RWLock::ReaderLock lm (alist->lock ());
+		const Evoral::ControlList::EventList& evs = alist->events ();
+		for (Evoral::ControlList::const_iterator i = evs.begin (); i != evs.end (); ++i) {
+			if (point_count > 0) { points_ss << ","; }
+			const samplepos_t samps = static_cast<samplepos_t> ((*i)->when.samples ());
+			const double      tsec  = static_cast<double> (samps) / static_cast<double> (sr);
+			points_ss << "{\"timeSec\":" << tsec
+			          << ",\"timeSamples\":" << samps
+			          << ",\"value\":" << (*i)->value
+			          << "}";
+			++point_count;
+		}
+	}
+	points_ss << "]";
+
+	std::ostringstream structured;
+	structured << "{\"routeId\":\"" << json_escape (route->id ().to_s ()) << "\""
+	           << ",\"parameter\":\"" << json_escape (param_str) << "\""
+	           << ",\"automationState\":\"" << auto_state_to_mcp_string (astate) << "\""
+	           << ",\"sampleRate\":" << sr
+	           << ",\"pointCount\":" << point_count
+	           << ",\"lower\":" << lower
+	           << ",\"upper\":" << upper
+	           << ",\"points\":" << points_ss.str ()
+	           << "}";
+
+	return jsonrpc_result (
+	    id,
+	    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"Automation lane\"}],\"structuredContent\":") +
+	        structured.str () + "}");
+}
+
+/* Replace all control points on an automation lane with the provided point list.
+ *
+ * Required args: id, parameter, points ([{timeSec: number>=0, value: number}])
+ * Optional arg:  mode (string, default "replace") — only "replace" supported in MVP.
+ * Wraps the mutation in a reversible command for undo. Uses editor_add_ordered with
+ * with_guard=false for clean programmatic writes (no guard points). */
+static std::string
+handle_automation_set_curve_tool (ARDOUR::Session& session, const pt::ptree& root, const std::string& id)
+{
+	const std::string route_id  = root.get<std::string> ("params.arguments.id", "");
+	const std::string param_str = root.get<std::string> ("params.arguments.parameter", "");
+	const std::string mode      = root.get<std::string> ("params.arguments.mode", "replace");
+
+	if (route_id.empty ()) {
+		return jsonrpc_error (id, -32602, "Missing route id");
+	}
+	if (param_str.empty ()) {
+		return jsonrpc_error (id, -32602, "Missing parameter");
+	}
+	if (mode != "replace") {
+		return jsonrpc_error (id, -32602, "Unsupported mode '" + mode + "'. Only 'replace' is supported.");
+	}
+
+	const std::shared_ptr<ARDOUR::Route> route = route_by_mcp_id (session, route_id);
+	if (!route) {
+		return jsonrpc_error (id, -32602, "Route not found");
+	}
+
+	std::string          param_err;
+	const Evoral::Parameter param = resolve_automation_parameter (param_str, param_err);
+	if (param.type () == ARDOUR::NullAutomation) {
+		return jsonrpc_error (id, -32602, param_err);
+	}
+
+	const std::shared_ptr<ARDOUR::AutomationControl> ctrl =
+	    get_route_automation_control (route, param);
+	if (!ctrl) {
+		return jsonrpc_error (id, -32602, "Parameter not available on this route");
+	}
+
+	const std::shared_ptr<ARDOUR::AutomationList> alist = ctrl->alist ();
+	if (!alist) {
+		return jsonrpc_error (id, -32000, "No automation list for parameter");
+	}
+
+	/* Parse input points array. */
+	Evoral::ControlList::OrderedPoints ops;
+	const boost::optional<const pt::ptree&> pts_node =
+	    root.get_child_optional ("params.arguments.points");
+	if (pts_node) {
+		for (const pt::ptree::value_type& kv : *pts_node) {
+			const boost::optional<double> tsec  = kv.second.get_optional<double> ("timeSec");
+			const boost::optional<double> value = kv.second.get_optional<double> ("value");
+			if (!tsec || !value) {
+				return jsonrpc_error (id, -32602, "Each point must have numeric 'timeSec' and 'value' fields");
+			}
+			if (*tsec < 0.0) {
+				return jsonrpc_error (id, -32602, "timeSec must be >= 0");
+			}
+			const samplepos_t samps = static_cast<samplepos_t> (std::floor (*tsec * session.sample_rate ()));
+			ops.emplace_back (Temporal::timepos_t (samps), *value);
+		}
+	}
+
+	/* Capture previous point count before mutation. */
+	const size_t prev_count = alist->size ();
+
+	/* Snapshot BEFORE state for undo. */
+	XMLNode& before = alist->get_state ();
+
+	/* Bulk-replace: freeze → clear → ordered-add → thaw.
+	 * Pattern from mergeable_line.cc:54-104 and automation_line.cc:1496-1503. */
+	alist->freeze ();
+	alist->clear ();
+	if (!ops.empty ()) {
+		/* with_guard=false: suppress 64-sample guard points for clean programmatic writes. */
+		alist->editor_add_ordered (ops, false);
+	}
+	alist->thaw ();
+
+	XMLNode& after = alist->get_state ();
+
+	/* Wrap in reversible command (undoable as one step). */
+	try {
+		session.begin_reversible_command ("automation: set curve");
+		session.add_command (
+		    new MementoCommand<ARDOUR::AutomationList> (*alist.get (), &before, &after));
+		session.commit_reversible_command ();
+	} catch (...) {
+		session.abort_reversible_command ();
+		return jsonrpc_error (id, -32000, "Internal error: failed to commit automation change");
+	}
+	session.set_dirty ();
+
+	std::ostringstream structured;
+	structured << "{\"routeId\":\"" << json_escape (route->id ().to_s ()) << "\""
+	           << ",\"parameter\":\"" << json_escape (param_str) << "\""
+	           << ",\"mode\":\"replace\""
+	           << ",\"pointsSet\":" << ops.size ()
+	           << ",\"previousPointCount\":" << prev_count
+	           << "}";
+
+	return jsonrpc_result (
+	    id,
+	    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"Automation curve set\"}],\"structuredContent\":") +
+	        structured.str () + "}");
+}
+
+/* Set the automation playback/record mode for a parameter on a route.
+ *
+ * Required args: id, parameter, mode ("off"|"play"|"read"|"touch"|"write"|"latch")
+ * Note: automation mode changes are not reversible commands in Ardour (consistent
+ * with OSC surface behavior). Delegates to route->set_parameter_automation_state(). */
+static std::string
+handle_automation_set_mode_tool (ARDOUR::Session& session, const pt::ptree& root, const std::string& id)
+{
+	const std::string route_id  = root.get<std::string> ("params.arguments.id", "");
+	const std::string param_str = root.get<std::string> ("params.arguments.parameter", "");
+	const std::string mode_str  = root.get<std::string> ("params.arguments.mode", "");
+
+	if (route_id.empty ())  { return jsonrpc_error (id, -32602, "Missing route id"); }
+	if (param_str.empty ()) { return jsonrpc_error (id, -32602, "Missing parameter"); }
+	if (mode_str.empty ())  { return jsonrpc_error (id, -32602, "Missing mode"); }
+
+	const std::shared_ptr<ARDOUR::Route> route = route_by_mcp_id (session, route_id);
+	if (!route) {
+		return jsonrpc_error (id, -32602, "Route not found");
+	}
+
+	std::string          param_err;
+	const Evoral::Parameter param = resolve_automation_parameter (param_str, param_err);
+	if (param.type () == ARDOUR::NullAutomation) {
+		return jsonrpc_error (id, -32602, param_err);
+	}
+
+	/* Validate that the parameter is applicable to this route
+	 * by checking that the control is non-null. */
+	const std::shared_ptr<ARDOUR::AutomationControl> ctrl =
+	    get_route_automation_control (route, param);
+	if (!ctrl) {
+		return jsonrpc_error (id, -32602, "Parameter not available on this route");
+	}
+
+	std::string       mode_err;
+	ARDOUR::AutoState new_state;
+	if (!mcp_string_to_auto_state (mode_str, new_state, mode_err)) {
+		return jsonrpc_error (id, -32602, mode_err);
+	}
+
+	const ARDOUR::AutoState prev_state = ctrl->automation_state ();
+
+	/* Delegates to Automatable::set_parameter_automation_state (automatable.h:104).
+	 * Not wrapped in a reversible command — automation state is not undoable in Ardour
+	 * (consistent with OSC surface behavior at osc.cc:4509-4534). */
+	route->set_parameter_automation_state (param, new_state);
+
+	std::ostringstream structured;
+	structured << "{\"routeId\":\"" << json_escape (route->id ().to_s ()) << "\""
+	           << ",\"parameter\":\"" << json_escape (param_str) << "\""
+	           << ",\"automationState\":\"" << auto_state_to_mcp_string (new_state) << "\""
+	           << ",\"previousState\":\"" << auto_state_to_mcp_string (prev_state) << "\""
+	           << "}";
+
+	return jsonrpc_result (
+	    id,
+	    std::string ("{\"content\":[{\"type\":\"text\",\"text\":\"Automation mode set\"}],\"structuredContent\":") +
+	        structured.str () + "}");
+}
+
+static bool
+dispatch_automation_tool_call (ARDOUR::Session& session, const std::string& tool_name, const pt::ptree& root, const std::string& id, std::string& response)
+{
+	if (tool_name == "automation/get_lane") {
+		response = handle_automation_get_lane_tool (session, root, id);
+		return true;
+	}
+	if (tool_name == "automation/set_curve") {
+		response = handle_automation_set_curve_tool (session, root, id);
+		return true;
+	}
+	if (tool_name == "automation/set_mode") {
+		response = handle_automation_set_mode_tool (session, root, id);
+		return true;
+	}
+	return false;
+}
+
 static bool
 dispatch_midi_region_tool_call (ARDOUR::Session& session, const std::string& tool_name, pt::ptree& root, const std::string& id, std::string& response)
 {
@@ -8685,6 +9028,9 @@ run_tools_call (ARDOUR::Session& session, PBD::EventLoop* event_loop, const std:
 		return response;
 	}
 	if (dispatch_midi_region_tool_call (session, tool_name, root, id, response)) {
+		return response;
+	}
+	if (dispatch_automation_tool_call (session, tool_name, root, id, response)) {
 		return response;
 	}
 
